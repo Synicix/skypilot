@@ -117,6 +117,104 @@ def test_create_pods_is_idempotent_when_all_pods_exist(monkeypatch):
     assert record.head_instance_id == head_name
 
 
+class TestCreatePodsResumedAfterPark:
+    """A launch that parked and resumed must not recreate deleted pods.
+
+    The production-shaped bug (found end to end on kind + Kueue): a parked
+    launch's pod is deleted (Kueue eviction, `kubectl delete`, an operator).
+    The condition resumes the launch, the resumed attempt re-enters
+    _create_pods, finds the pod missing and silently creates a new one, which
+    joins the back of the queue. Without parking the same deletion fails the
+    launch with the deleted-pods error. A resume must behave the same way:
+    the pods it finds missing were created by this attempt before it parked,
+    so they were deleted, not never created.
+    """
+
+    _CLUSTER = 'test-cluster-park'
+
+    def _setup(self, monkeypatch, existing, *, requested_before):
+        head_name = f'{self._CLUSTER}-head'
+        _patch_create_pods_k8s_boundary(
+            monkeypatch, existing, head_name if head_name in existing else None)
+        monkeypatch.setattr(instance.global_user_state,
+                            'get_launch_milestone_for_cluster',
+                            lambda cluster_name, milestone: requested_before)
+        monkeypatch.setattr(instance.global_user_state,
+                            'record_launch_milestone_for_cluster',
+                            lambda *a, **k: None)
+        core_api = mock.MagicMock()
+
+        def created(namespace, body, **kwargs):
+            # The pod the API server hands back: named and labelled as the
+            # spec asked, so the head is recognised as the head.
+            del namespace, kwargs
+            pod = mock.MagicMock()
+            pod.metadata.name = body['metadata']['name']
+            pod.metadata.labels = body['metadata']['labels']
+            return pod
+
+        core_api.create_namespaced_pod.side_effect = created
+        monkeypatch.setattr(kubernetes, 'core_api', lambda *a, **k: core_api)
+        monkeypatch.setattr(subprocess_utils, 'run_in_parallel',
+                            lambda fn, items, *a, **k: [fn(i) for i in items])
+        deleted_error = mock.MagicMock(
+            side_effect=lambda **kwargs: config_lib.KubernetesError(
+                f'deleted: {sorted(kwargs["deleted_pods"])}'))
+        monkeypatch.setattr(instance, '_deleted_pods_error', deleted_error)
+        return core_api, deleted_error
+
+    def test_resume_raises_when_all_parked_pods_were_deleted(self, monkeypatch):
+        core_api, deleted_error = self._setup(monkeypatch, {},
+                                              requested_before=110.0)
+        with pytest.raises(config_lib.KubernetesError, match='deleted'):
+            instance._create_pods('us', 'cn', self._CLUSTER,
+                                  _make_provision_config(count=2))
+        core_api.create_namespaced_pod.assert_not_called()
+        kwargs = deleted_error.call_args.kwargs
+        assert set(kwargs['deleted_pods']) == {
+            f'{self._CLUSTER}-head', f'{self._CLUSTER}-worker1'
+        }
+        assert kwargs['cluster_name'] == 'cn'
+        assert kwargs['namespace'] == 'ns'
+
+    def test_resume_raises_when_some_parked_pods_were_deleted(
+            self, monkeypatch):
+        head = f'{self._CLUSTER}-head'
+        core_api, deleted_error = self._setup(monkeypatch,
+                                              {head: _fake_pod(head)},
+                                              requested_before=110.0)
+        with pytest.raises(config_lib.KubernetesError, match='deleted'):
+            instance._create_pods('us', 'cn', self._CLUSTER,
+                                  _make_provision_config(count=2))
+        core_api.create_namespaced_pod.assert_not_called()
+        assert set(deleted_error.call_args.kwargs['deleted_pods']) == {
+            f'{self._CLUSTER}-worker1'
+        }
+
+    def test_resume_with_all_pods_present_creates_nothing(self, monkeypatch):
+        head = f'{self._CLUSTER}-head'
+        worker = f'{self._CLUSTER}-worker1'
+        core_api, deleted_error = self._setup(monkeypatch, {
+            head: _fake_pod(head),
+            worker: _fake_pod(worker)
+        },
+                                              requested_before=110.0)
+        record = instance._create_pods('us', 'cn', self._CLUSTER,
+                                       _make_provision_config(count=2))
+        core_api.create_namespaced_pod.assert_not_called()
+        deleted_error.assert_not_called()
+        assert record.head_instance_id == head
+
+    def test_first_attempt_creates_missing_pods(self, monkeypatch):
+        """Unchanged for a launch that has not requested pods yet."""
+        core_api, deleted_error = self._setup(monkeypatch, {},
+                                              requested_before=None)
+        instance._create_pods('us', 'cn', self._CLUSTER,
+                              _make_provision_config(count=2))
+        assert core_api.create_namespaced_pod.call_count == 2
+        deleted_error.assert_not_called()
+
+
 def test_create_pods_raises_on_more_pods_than_requested(monkeypatch):
     """More running+pending pods than requested trips the leak guard."""
     cluster_on_cloud = 'test-cluster-xyz'

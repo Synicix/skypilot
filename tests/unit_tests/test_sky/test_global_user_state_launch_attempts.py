@@ -500,6 +500,9 @@ def test_recording_a_launch_attempt_cannot_raise(monkeypatch):
         'c', _MILESTONE.INSTANCES_REQUESTED, time.time())
     global_user_state.record_launch_queue_for_cluster('c', 'some-queue')
     global_user_state.close_launch_attempt('some-attempt', _OPEN.SUCCEEDED)
+    # The one reader on the launch path answers None rather than raising.
+    assert global_user_state.get_launch_milestone_for_cluster(
+        'c', _MILESTONE.INSTANCES_REQUESTED) is None
 
 
 @pytest.mark.parametrize('returning', [True, False])
@@ -563,3 +566,35 @@ def test_opening_an_attempt_survives_its_own_arguments_failing(monkeypatch):
 
     assert provisioner._existing_cluster_hash('some-cluster') is None
     assert provisioner._active_workspace() is None
+
+
+def test_milestone_for_cluster_reads_the_attempt_in_flight(
+        tmp_path, monkeypatch):
+    """A resumed provisioning step asks whether *this* attempt already passed
+    a milestone (e.g. requested its instances before it parked)."""
+    _fresh_db(tmp_path, monkeypatch)
+    get = global_user_state.get_launch_milestone_for_cluster
+
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None  # No attempt.
+    attempt = _open(cluster='c', start=100.0)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None  # Not yet passed.
+    global_user_state.record_launch_milestone(attempt,
+                                              _MILESTONE.INSTANCES_REQUESTED,
+                                              110.0)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED) == 110.0
+
+
+def test_milestone_for_cluster_ignores_closed_attempts(tmp_path, monkeypatch):
+    """A failover closes the attempt before the next opens: the new attempt
+    has not requested anything, whatever the closed one did."""
+    _fresh_db(tmp_path, monkeypatch)
+    get = global_user_state.get_launch_milestone_for_cluster
+
+    first = _open(cluster='c', request='req-1', start=100.0)
+    global_user_state.record_launch_milestone(first,
+                                              _MILESTONE.INSTANCES_REQUESTED,
+                                              110.0)
+    global_user_state.close_launch_attempt(first, _OPEN.FAILED)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None
+    _open(cluster='c', request='req-1', start=200.0)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None

@@ -4555,6 +4555,37 @@ def record_launch_queue_for_cluster(cluster_name: str, queue: str) -> None:
 
 @_best_effort
 @db_retries.retry
+def get_launch_milestone_for_cluster(
+        cluster_name: str, milestone: LaunchMilestone) -> Optional[float]:
+    """When the attempt in flight for this cluster passed *milestone*, if yet.
+
+    The read side of record_launch_milestone_for_cluster, choosing the attempt
+    the same way. Because a resumed launch continues its attempt and a failover
+    starts a new one, a milestone set here was passed by *this* launch, before
+    a pause if it is being re-walked now. None when nothing is in flight, and
+    when the read fails: it runs on the launch path, where a lost answer only
+    costs the caller its default.
+    """
+    column = launch_attempt_table.c[milestone.value]
+    engine = _db_manager.get_engine()
+    with orm.Session(engine) as session:
+        row = session.execute(
+            sqlalchemy.select(column).where(
+                sqlalchemy.and_(
+                    sqlalchemy.or_(
+                        launch_attempt_table.c.cluster_name == cluster_name,
+                        launch_attempt_table.c.cluster_name_on_cloud ==
+                        cluster_name,
+                    ),
+                    launch_attempt_table.c.outcome.is_(None),
+                )).order_by(launch_attempt_table.c.provision_start.desc(),
+                            launch_attempt_table.c.attempt_seq.desc()).limit(
+                                1)).fetchone()
+        return None if row is None else row[0]
+
+
+@_best_effort
+@db_retries.retry
 def record_launch_milestone_for_cluster(cluster_name: str,
                                         milestone: LaunchMilestone,
                                         timestamp: float) -> None:

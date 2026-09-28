@@ -2579,6 +2579,14 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     context = kubernetes_utils.get_control_context_from_config(provider_config)
     pod_spec = copy.deepcopy(config.node_config)
     create_pods_start = datetime.datetime.now(datetime.timezone.utc)
+    # Whether this attempt already asked for its pods: a launch that parked
+    # while waiting for them (see KubernetesPodWaitCondition) re-enters here
+    # when it resumes, and its attempt -- continued across the pause, unlike a
+    # failover's -- still carries the milestone recorded below. Any of its
+    # pods missing now were deleted while it was parked, not never created.
+    resumed_after_park = (global_user_state.get_launch_milestone_for_cluster(
+        cluster_name, global_user_state.LaunchMilestone.INSTANCES_REQUESTED)
+                          is not None)
     # Closes the provision-setup segment of this launch attempt and opens the
     # admission-wait one. The same reference point _wait_for_pods_to_schedule
     # measures from, so the two agree. Write-once, so a resumed launch
@@ -2635,6 +2643,9 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
 
     terminating_pods = kubernetes_utils.filter_pods(namespace, context, tags,
                                                     ['Terminating'])
+    # The deleter may have left its reason on a pod on its way out; keep the
+    # objects for the error below.
+    first_seen_terminating = dict(terminating_pods)
     start_time = time.time()
     while (terminating_pods and
            time.time() - start_time < _TIMEOUT_FOR_POD_TERMINATION):
@@ -2688,6 +2699,27 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     } for pod in running_pods.values()]
     logger.debug(f'Found {len(running_pods)} existing pods: '
                  f'{running_pod_statuses}')
+
+    if resumed_after_park and not to_create_deployment:
+        # Recreating the missing pods would quietly put the launch at the back
+        # of the queue and hide why its pods went away (an eviction, an
+        # operator); fail with the reason instead, as a launch that waited in
+        # its worker does when its pods are deleted.
+        expected_pod_names = {f'{cluster_name_on_cloud}-head'} | {
+            f'{cluster_name_on_cloud}-worker{i}'
+            for i in range(1, config.count)
+        }
+        deleted_pod_names = sorted(expected_pod_names - set(running_pods))
+        if deleted_pod_names:
+            raise _deleted_pods_error(
+                context=context,
+                namespace=namespace,
+                cluster_name=cluster_name,
+                deleted_pods={
+                    name: first_seen_terminating.get(name)
+                    for name in deleted_pod_names
+                },
+                since={name: None for name in deleted_pod_names})
 
     to_start_count = config.count - len(running_pods)
     if to_start_count < 0:
