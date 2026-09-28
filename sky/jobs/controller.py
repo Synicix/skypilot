@@ -821,6 +821,28 @@ class JobController:
             cluster_name, job_id_on_pool_cluster = (
                 await
                 managed_job_state.get_pool_submit_info_async(self._job_id))
+            if is_resume and cluster_name is None:
+                # The previous controller died while this job was still
+                # waiting for a pool worker: nothing was ever launched for it
+                # (a worker, once assigned, stays recorded), so there is
+                # nothing to re-attach to. Pick up where it left off -- wait
+                # for a worker and start -- unless it was being cancelled.
+                status = await (
+                    managed_job_state.get_job_status_with_task_id_async(
+                        job_id=self._job_id, task_id=task_id))
+                if status in (managed_job_state.ManagedJobStatus.CANCELLING,
+                              managed_job_state.ManagedJobStatus.CANCELLED):
+                    logger.info(f'Job {self._job_id}, task {task_id} was '
+                                'cancelled while waiting for a pool worker.')
+                    raise asyncio.CancelledError()
+                logger.info(f'Job {self._job_id}, task {task_id} was still '
+                            'waiting for a pool worker; launching it.')
+                is_resume = False
+                remote_job_submitted_at = (
+                    await self._strategy_executor.launch())
+                cluster_name, job_id_on_pool_cluster = (
+                    await managed_job_state.get_pool_submit_info_async(
+                        self._job_id))
         if cluster_name is None:
             # Check if we have been cancelled here, in the case where a user
             # quickly cancels the job we want to gracefully handle it here,

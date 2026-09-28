@@ -3132,3 +3132,158 @@ class TestStartJobLaunchSlots:
 
         await manager.start_job(1, pool=None)
         assert manager.starting == {1}
+
+
+@pytest.fixture
+def _seed_pool_job_starting_without_worker(_mock_managed_jobs_db_conn):
+    """Seed a pool job left STARTING with no pool worker assigned.
+
+    The state a pool job is in when the controller (e.g. the API server in
+    consolidation mode) restarts while the job is still waiting for a free
+    worker: set_starting_async has run, get_next_cluster_name has not yet
+    returned a worker, so current_cluster_name is NULL. Returns job_id.
+    """
+
+    async def mock_callback(status: str):
+        del status  # unused
+
+    async def create_job() -> int:
+        job_id = managed_job_state.set_job_info_without_job_id(
+            name='pool-job',
+            workspace='default',
+            entrypoint='ep',
+            pool='my-pool',
+            pool_hash='pool-hash',
+            user_hash='user1')
+        managed_job_state.set_pending(job_id,
+                                      task_id=0,
+                                      task_name='work',
+                                      resources_str='{}',
+                                      metadata='{}')
+        await managed_job_state.set_starting_async(job_id, 0, 'run_0',
+                                                   time.time(), '{}', {},
+                                                   mock_callback)
+        return job_id
+
+    return asyncio.run(create_job())
+
+
+class TestResumePoolJobWaitingForWorker:
+    """A pool job still waiting for a worker must survive a controller
+    restart.
+
+    The production bug (PLT-3598): on restart such a job is classified
+    RESUME (its task is STARTING), the resume path skips the launch, reads
+    no worker from the pool submit info and hits
+    ``assert cluster_name is not None`` -> FAILED_CONTROLLER. 36 of 60 such
+    jobs died in a single API-server restart during testing. Nothing was
+    ever launched for these jobs, so resuming one means launching it.
+    """
+
+    @staticmethod
+    def _task():
+        task = MagicMock()
+        task.name = 'work'
+        task.metadata = {}
+        task.run = 'echo hi'
+        task.envs = {constants.TASK_ID_ENV_VAR: 'test-task-id'}
+        task.resources = None
+        # Starting the task runs its event callback for real; a MagicMock
+        # attribute would be run as a bash command.
+        task.event_callback = None
+        return task
+
+    @staticmethod
+    def _controller(job_id: int) -> JobController:
+        controller = JobController.__new__(JobController)
+        controller._job_id = job_id
+        controller._dag = MagicMock()
+        controller._pool = 'my-pool'
+        controller._backend = MagicMock()
+        controller._backend.run_timestamp = 'sky-2024-01-01-00-00-00-000000'
+        controller.starting = set()
+        controller.starting_lock = asyncio.Lock()
+        controller.starting_signal = MagicMock()
+        return controller
+
+    @staticmethod
+    def _executor(job_id: int, assign_worker: bool = True):
+        """A strategy executor whose launch() gets a pool worker the way the
+        real pool path does: by recording it in the job's submit info."""
+        executor = MagicMock()
+
+        async def launch():
+            if assign_worker:
+                managed_job_state.set_current_cluster_name(
+                    job_id, 'pool-worker-1')
+                await managed_job_state.set_job_id_on_pool_cluster_async(
+                    job_id, 7)
+            return time.time()
+
+        executor.launch = AsyncMock(side_effect=launch)
+        executor.on_resume = AsyncMock()
+        executor.monitor_task = AsyncMock(return_value=True)
+        return executor
+
+    @contextlib.contextmanager
+    def _patched(self, executor):
+        with patch('sky.jobs.controller._add_k8s_annotations'), \
+             patch('sky.jobs.controller._build_task_specs'), \
+             patch('sky.jobs.recovery_strategy.StrategyExecutor.make',
+                   return_value=executor), \
+             patch('sky.jobs.state.get_file_mounts_blob_id',
+                   return_value=None):
+            yield
+
+    @pytest.mark.asyncio
+    async def test_resume_pool_job_without_worker_launches(
+            self, _seed_pool_job_starting_without_worker):
+        job_id = _seed_pool_job_starting_without_worker
+        executor = self._executor(job_id)
+        with self._patched(executor):
+            result = await self._controller(job_id)._run_one_task(
+                0, self._task())
+
+        assert result is True
+        executor.launch.assert_awaited_once()
+        monitor_kwargs = executor.monitor_task.await_args.kwargs
+        assert monitor_kwargs['cluster_name'] == 'pool-worker-1'
+        assert monitor_kwargs['job_id_on_pool_cluster'] == 7
+        # Freshly started, not treated as an interrupted run to recover.
+        assert monitor_kwargs['force_transit_to_recovering'] is False
+        status = await managed_job_state.get_job_status_with_task_id_async(
+            job_id=job_id, task_id=0)
+        assert status == managed_job_state.ManagedJobStatus.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_resume_pool_job_cancelling_while_waiting(
+            self, _seed_pool_job_starting_without_worker):
+        job_id = _seed_pool_job_starting_without_worker
+
+        async def mock_callback(status: str):
+            del status  # unused
+
+        await managed_job_state.set_cancelling_async(job_id, mock_callback)
+        executor = self._executor(job_id)
+        with self._patched(executor), pytest.raises(asyncio.CancelledError):
+            await self._controller(job_id)._run_one_task(0, self._task())
+        executor.launch.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_resume_pool_job_with_worker_unchanged(
+            self, _seed_pool_job_starting_without_worker):
+        """A job that already had a worker keeps today's resume path: no
+        new launch, straight to monitoring (which recovers it)."""
+        job_id = _seed_pool_job_starting_without_worker
+        managed_job_state.set_current_cluster_name(job_id, 'pool-worker-1')
+        await managed_job_state.set_job_id_on_pool_cluster_async(job_id, 7)
+        executor = self._executor(job_id)
+        with self._patched(executor):
+            result = await self._controller(job_id)._run_one_task(
+                0, self._task())
+
+        assert result is True
+        executor.launch.assert_not_awaited()
+        monitor_kwargs = executor.monitor_task.await_args.kwargs
+        assert monitor_kwargs['cluster_name'] == 'pool-worker-1'
+        assert monitor_kwargs['force_transit_to_recovering'] is True
