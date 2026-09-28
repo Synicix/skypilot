@@ -289,8 +289,7 @@ def _pod_is_scheduled(pod) -> bool:
 def _unschedulable_message(pod) -> Optional[str]:
     """The scheduler's explanation for a pod it cannot place, if any."""
     for condition in (pod.status.conditions or []):
-        if (condition.type == 'PodScheduled' and
-                condition.status == 'False' and
+        if (condition.type == 'PodScheduled' and condition.status == 'False' and
                 condition.reason == 'Unschedulable'):
             return condition.message or condition.reason
     return None
@@ -373,12 +372,14 @@ class KubernetesPodWaitCondition:
             return False, None
         pods_by_name = {pod.metadata.name: pod for pod in pods}
         expected = [pods_by_name.get(name) for name in self.expected_pod_names]
-        if any(pod is None or pod.metadata.deletion_timestamp is not None
-               for pod in expected):
+        present = [pod for pod in expected if pod is not None]
+        if (len(present) != len(expected) or
+                any(pod.metadata.deletion_timestamp is not None
+                    for pod in present)):
             return True, None
         if self.mode == PARK_MODE_ADMISSION:
-            return not any(pod.spec.scheduling_gates for pod in expected), None
-        unscheduled = [pod for pod in expected if not _pod_is_scheduled(pod)]
+            return not any(pod.spec.scheduling_gates for pod in present), None
+        unscheduled = [pod for pod in present if not _pod_is_scheduled(pod)]
         if not unscheduled:
             return True, None
         return False, _scheduling_wait_message(
@@ -458,7 +459,9 @@ def _gated_wait_anchor(pods: List[Any], expected_pod_names: Set[str],
             continue
         created = pod.metadata.creation_timestamp
         if isinstance(created, datetime.datetime):
-            anchor = min(anchor, _utc(created).timestamp())
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+            anchor = min(anchor, created.timestamp())
     return anchor
 
 
@@ -1420,8 +1423,7 @@ def _wait_for_pods_to_schedule(namespace,
                 _request_timeout=_POD_POLL_REQUEST_TIMEOUT).items
             transport_error_since = None
             if gated_wait_anchor is None:
-                gated_wait_anchor = _gated_wait_anchor(pods,
-                                                       expected_pod_names,
+                gated_wait_anchor = _gated_wait_anchor(pods, expected_pod_names,
                                                        start_time)
         except (kubernetes.api_exception(),
                 kubernetes.urllib3_http_error()) as e:
@@ -1685,8 +1687,8 @@ def _wait_for_pods_to_schedule(namespace,
         # _PARK_AFTER_UNSCHEDULABLE_SECONDS). A volume wait or a scale-up in
         # flight keeps the worker: both have their own diagnostics and ends.
         if (timeout < 0 and volume_wait_msg is None and
-                not scale_up_in_flight and
-                all(_unschedulable_message(pod) is not None
+                not scale_up_in_flight and all(
+                    _unschedulable_message(pod) is not None
                     for pod in unscheduled_pods)):
             if unschedulable_since is None:
                 unschedulable_since = time.time()

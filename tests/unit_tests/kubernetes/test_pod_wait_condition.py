@@ -85,14 +85,13 @@ def _serve(monkeypatch, *polls):
 def _condition(mode: str,
                pods=('pod-0',),
                deadline=None) -> instance.KubernetesPodWaitCondition:
-    return instance.KubernetesPodWaitCondition(
-        context='kind-q',
-        namespace='skypilot-e2e',
-        cluster_name_on_cloud=_CLUSTER,
-        expected_pod_names=list(pods),
-        mode=mode,
-        deadline=deadline,
-        poll_seconds=10.0)
+    return instance.KubernetesPodWaitCondition(context='kind-q',
+                                               namespace='skypilot-e2e',
+                                               cluster_name_on_cloud=_CLUSTER,
+                                               expected_pod_names=list(pods),
+                                               mode=mode,
+                                               deadline=deadline,
+                                               poll_seconds=10.0)
 
 
 @pytest.fixture
@@ -123,11 +122,11 @@ class TestProbe:
         assert condition._probe()[0] is False
 
     def test_scheduling_resumes_when_all_scheduled(self, monkeypatch):
-        _serve(monkeypatch,
-               [_pod('pod-0', scheduled=True),
-                _pod('pod-1', unschedulable_msg='0/3 nodes are available')],
-               [_pod('pod-0', scheduled=True),
-                _pod('pod-1', scheduled=True)])
+        _serve(monkeypatch, [
+            _pod('pod-0', scheduled=True),
+            _pod('pod-1', unschedulable_msg='0/3 nodes are available')
+        ], [_pod('pod-0', scheduled=True),
+            _pod('pod-1', scheduled=True)])
         condition = _condition(instance.PARK_MODE_SCHEDULING,
                                pods=('pod-0', 'pod-1'))
         assert condition._probe() == (
@@ -179,8 +178,9 @@ class TestWait:
         async def is_cancelled():
             return True
 
-        result = await _condition(instance.PARK_MODE_ADMISSION).wait_async(
-            is_cancelled=is_cancelled, fallback_wait_seconds=30)
+        result = await _condition(instance.PARK_MODE_ADMISSION
+                                 ).wait_async(is_cancelled=is_cancelled,
+                                              fallback_wait_seconds=30)
         assert result is False
         assert core_api.list_namespaced_pod.call_count == 0
         assert no_sleep == []
@@ -195,22 +195,23 @@ class TestWait:
         async def is_cancelled():
             return False
 
-        result = await _condition(instance.PARK_MODE_ADMISSION).wait_async(
-            is_cancelled=is_cancelled, fallback_wait_seconds=30)
+        result = await _condition(instance.PARK_MODE_ADMISSION
+                                 ).wait_async(is_cancelled=is_cancelled,
+                                              fallback_wait_seconds=30)
         assert result is True
         assert no_sleep == []
 
     @pytest.mark.asyncio
-    async def test_wait_async_polls_until_admitted(self, monkeypatch,
-                                                   no_sleep):
+    async def test_wait_async_polls_until_admitted(self, monkeypatch, no_sleep):
         _serve(monkeypatch, [_pod('pod-0', gated=True)],
                [_pod('pod-0', gated=True)], [_pod('pod-0')])
 
         async def is_cancelled():
             return False
 
-        result = await _condition(instance.PARK_MODE_ADMISSION).wait_async(
-            is_cancelled=is_cancelled, fallback_wait_seconds=30)
+        result = await _condition(instance.PARK_MODE_ADMISSION
+                                 ).wait_async(is_cancelled=is_cancelled,
+                                              fallback_wait_seconds=30)
         assert result is True
         assert no_sleep == [10.0, 10.0]
 
@@ -243,8 +244,8 @@ class TestWait:
         ]
 
     @pytest.mark.asyncio
-    async def test_wait_async_without_update_status_msg(
-            self, monkeypatch, no_sleep):
+    async def test_wait_async_without_update_status_msg(self, monkeypatch,
+                                                        no_sleep):
         """The scheduler omits update_status_msg for conditions whose wait
         predates it; the condition must not require it."""
         del no_sleep
@@ -258,8 +259,8 @@ class TestWait:
             is_cancelled=is_cancelled, fallback_wait_seconds=30) is True
 
     def test_wait_and_wait_async_agree(self, monkeypatch, no_sleep):
-        timeline = ([_pod('pod-0', unschedulable_msg='a')],
-                    [_pod('pod-0', unschedulable_msg='b')],
+        timeline = ([_pod('pod-0', unschedulable_msg='a')
+                    ], [_pod('pod-0', unschedulable_msg='b')],
                     [_pod('pod-0', scheduled=True)])
 
         sync_api = _serve(monkeypatch, *timeline)
@@ -295,8 +296,8 @@ class TestWait:
         assert (sync_api.list_namespaced_pod.call_count ==
                 async_api.list_namespaced_pod.call_count == 3)
 
-    def test_wait_returns_false_when_cancelled_mid_wait(
-            self, monkeypatch, no_sleep):
+    def test_wait_returns_false_when_cancelled_mid_wait(self, monkeypatch,
+                                                        no_sleep):
         del no_sleep
         _serve(monkeypatch, [_pod('pod-0', gated=True)])
         answers = iter([False, False, True])

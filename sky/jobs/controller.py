@@ -838,11 +838,11 @@ class JobController:
                 logger.info(f'Job {self._job_id}, task {task_id} was still '
                             'waiting for a pool worker; launching it.')
                 is_resume = False
-                remote_job_submitted_at = (
-                    await self._strategy_executor.launch())
+                remote_job_submitted_at = (await
+                                           self._strategy_executor.launch())
                 cluster_name, job_id_on_pool_cluster = (
-                    await managed_job_state.get_pool_submit_info_async(
-                        self._job_id))
+                    await
+                    managed_job_state.get_pool_submit_info_async(self._job_id))
         if cluster_name is None:
             # Check if we have been cancelled here, in the case where a user
             # quickly cancels the job we want to gracefully handle it here,

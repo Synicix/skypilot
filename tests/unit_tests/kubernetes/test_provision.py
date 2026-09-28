@@ -2275,8 +2275,8 @@ class TestWaitForPodsToScheduleParking:
 
     def test_naive_creation_timestamp_is_utc(self, monkeypatch):
         pod = self._gated()
-        pod.metadata.creation_timestamp = datetime.datetime(1970, 1, 1, 0, 0,
-                                                            10)
+        pod.metadata.creation_timestamp = datetime.datetime(
+            1970, 1, 1, 0, 0, 10)
         self._setup(monkeypatch, [(0.0, [pod])], start=50.0)
         with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
             self._wait(admission_timeout=100)
@@ -2381,9 +2381,10 @@ class TestWaitForPodsToScheduleParking:
         clock, _, _ = self._setup(monkeypatch,
                                   [(0.0, [self._unschedulable_pod()]),
                                    (300.0, [self._running()])])
-        monkeypatch.setattr(instance._PendingVolumeProbe, 'probe',
-                            lambda self, pods, hold_failures: 'waiting for '
-                            'volume data to bind')
+        monkeypatch.setattr(
+            instance._PendingVolumeProbe, 'probe',
+            lambda self, pods, hold_failures: 'waiting for '
+            'volume data to bind')
         self._wait(timeout=-1)
         assert clock.now >= 300
 
@@ -2402,8 +2403,9 @@ class TestWaitForPodsToScheduleParking:
     def test_run_instances_propagates_pause(self, monkeypatch):
         """run_instances re-raises only Kubernetes errors after logging;
         the pause must reach the provisioner untouched."""
-        pause = sky_exceptions.ExecutionPausedError('Waiting for queue '
-                                                    'admission', 'hint', 30)
+        pause = sky_exceptions.ExecutionPausedError(
+            'Waiting for queue '
+            'admission', 'hint', 30)
         monkeypatch.setattr(instance, '_create_pods',
                             mock.MagicMock(side_effect=pause))
         with pytest.raises(sky_exceptions.ExecutionPausedError):
