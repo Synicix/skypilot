@@ -132,13 +132,27 @@ class TestCreatePodsResumedAfterPark:
 
     _CLUSTER = 'test-cluster-park'
 
-    def _setup(self, monkeypatch, existing, *, requested_before):
+    def _setup(self,
+               monkeypatch,
+               existing,
+               *,
+               requested_before,
+               in_request=True):
         head_name = f'{self._CLUSTER}-head'
         _patch_create_pods_k8s_boundary(
             monkeypatch, existing, head_name if head_name in existing else None)
+        self.milestone_lookups = []
+
+        def get_milestone(cluster_name, milestone, request_id=None):
+            self.milestone_lookups.append(request_id)
+            return requested_before
+
         monkeypatch.setattr(instance.global_user_state,
-                            'get_launch_milestone_for_cluster',
-                            lambda cluster_name, milestone: requested_before)
+                            'get_launch_milestone_for_cluster', get_milestone)
+        monkeypatch.setattr(instance.common_utils, 'is_in_request_context',
+                            lambda: in_request)
+        monkeypatch.setattr(instance.common_utils, 'get_current_request_id',
+                            lambda: 'req-A')
         monkeypatch.setattr(instance.global_user_state,
                             'record_launch_milestone_for_cluster',
                             lambda *a, **k: None)
@@ -170,6 +184,7 @@ class TestCreatePodsResumedAfterPark:
             instance._create_pods('us', 'cn', self._CLUSTER,
                                   _make_provision_config(count=2))
         core_api.create_namespaced_pod.assert_not_called()
+        assert self.milestone_lookups == ['req-A']
         kwargs = deleted_error.call_args.kwargs
         assert set(kwargs['deleted_pods']) == {
             f'{self._CLUSTER}-head', f'{self._CLUSTER}-worker1'
@@ -204,6 +219,17 @@ class TestCreatePodsResumedAfterPark:
         core_api.create_namespaced_pod.assert_not_called()
         deleted_error.assert_not_called()
         assert record.head_instance_id == head
+
+    def test_outside_a_request_nothing_was_parked(self, monkeypatch):
+        """Only a server request can park, so outside one a milestone on
+        some open attempt of the name never means these pods were deleted."""
+        core_api, deleted_error = self._setup(monkeypatch, {},
+                                              requested_before=110.0,
+                                              in_request=False)
+        instance._create_pods('us', 'cn', self._CLUSTER,
+                              _make_provision_config(count=2))
+        assert core_api.create_namespaced_pod.call_count == 2
+        deleted_error.assert_not_called()
 
     def test_first_attempt_creates_missing_pods(self, monkeypatch):
         """Unchanged for a launch that has not requested pods yet."""
@@ -2228,10 +2254,23 @@ class TestWaitForPodsToScheduleParking:
                *,
                in_request=True,
                config=None,
-               start=0.0):
+               start=0.0,
+               requested_at=None):
         """Serve pods by simulated time; *pod_timeline* is a list of
-        (since, [pods]). *config* maps config keys to values."""
+        (since, [pods]). *config* maps config keys to values.
+        *requested_at* is when this request's launch attempt requested its
+        pods (the INSTANCES_REQUESTED milestone), if it has."""
         config = dict(config or {})
+        self.milestone_lookups = []
+
+        def get_milestone(cluster_name, milestone, request_id=None):
+            self.milestone_lookups.append((cluster_name, milestone, request_id))
+            return requested_at
+
+        monkeypatch.setattr(instance.global_user_state,
+                            'get_launch_milestone_for_cluster', get_milestone)
+        monkeypatch.setattr(instance.common_utils, 'get_current_request_id',
+                            lambda: 'req-A')
 
         def mock_config(cloud, region, keys, default_value=None, **kwargs):
             del cloud, region, kwargs
@@ -2348,42 +2387,67 @@ class TestWaitForPodsToScheduleParking:
             self._wait(admission_timeout=100)
         assert clock.now >= 100
 
-    def test_park_deadline_anchored_at_pod_creation(self, monkeypatch):
-        """The admission budget is counted from when the pods were created,
-        which survives a park, not from when this attempt started."""
-        pod = self._gated()
-        pod.metadata.creation_timestamp = datetime.datetime(
-            1970, 1, 1, tzinfo=datetime.timezone.utc)
-        self._setup(monkeypatch, [(0.0, [pod])], start=50.0)
+    def test_park_deadline_anchored_at_this_requests_pod_request(
+            self, monkeypatch):
+        """The admission budget counts from when this request asked for its
+        pods, which survives a park, not from when this attempt started."""
+        self._setup(monkeypatch, [(0.0, [self._gated()])],
+                    start=50.0,
+                    requested_at=0.0)
         with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
             self._wait(admission_timeout=100)
         assert info.value.continue_condition.deadline == 100.0
+        # Looked up for this request only, not any open attempt of the name.
+        assert ('cn',
+                instance.global_user_state.LaunchMilestone.INSTANCES_REQUESTED,
+                'req-A') in self.milestone_lookups
 
     def test_resume_after_deadline_raises_admission_error(self, monkeypatch):
         """A resumed attempt past the original deadline fails at once with
         the admission error instead of starting a fresh budget."""
-        pod = self._gated()
-        pod.metadata.creation_timestamp = datetime.datetime(
-            1970, 1, 1, tzinfo=datetime.timezone.utc)
-        clock, _, _ = self._setup(monkeypatch, [(0.0, [pod])], start=101.0)
+        clock, _, _ = self._setup(monkeypatch, [(0.0, [self._gated()])],
+                                  start=101.0,
+                                  requested_at=0.0)
         with pytest.raises(config_lib.KubernetesError,
                            match='scheduling gates'):
             self._wait(admission_timeout=100)
         assert clock.now < 105
 
-    def test_naive_creation_timestamp_is_utc(self, monkeypatch):
+    def test_old_pod_does_not_spend_a_new_requests_budget(self, monkeypatch):
+        """A gated pod left from an earlier request (e.g. one cancelled with
+        `sky api cancel`) is days old; a new request re-using it gets its
+        own full budget, not what is left of that pod's."""
         pod = self._gated()
         pod.metadata.creation_timestamp = datetime.datetime(
-            1970, 1, 1, 0, 0, 10)
-        self._setup(monkeypatch, [(0.0, [pod])], start=50.0)
+            1970, 1, 1, tzinfo=datetime.timezone.utc)
+        self._setup(monkeypatch, [(0.0, [pod])], start=50.0, requested_at=50.0)
         with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
             self._wait(admission_timeout=100)
-        assert info.value.continue_condition.deadline == 110.0
+        assert info.value.continue_condition.deadline == 150.0
+
+    def test_no_milestone_anchors_at_attempt_start(self, monkeypatch):
+        self._setup(monkeypatch, [(0.0, [self._gated()])],
+                    start=50.0,
+                    requested_at=None)
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(admission_timeout=100)
+        assert info.value.continue_condition.deadline == 150.0
 
     def test_admission_timeout_negative_gives_no_deadline(self, monkeypatch):
         self._setup(monkeypatch, [(0.0, [self._gated()])])
         with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
             self._wait(admission_timeout=-1)
+        assert info.value.continue_condition.deadline is None
+
+    def test_infinite_provision_timeout_gives_no_deadline(self, monkeypatch):
+        """provision_timeout < 0 leaves the admission wait unbounded in the
+        loop (as before parking). The condition must agree: a deadline the
+        resumed attempt does not enforce would resume it the moment it
+        passed, re-park 30 s later, and repeat -- holding a worker nearly
+        all the time."""
+        self._setup(monkeypatch, [(0.0, [self._gated()])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(timeout=-1, admission_timeout=300)
         assert info.value.continue_condition.deadline is None
 
     def test_partially_gated_group_parks(self, monkeypatch):

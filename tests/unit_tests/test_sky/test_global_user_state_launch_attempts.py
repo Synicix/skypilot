@@ -598,3 +598,27 @@ def test_milestone_for_cluster_ignores_closed_attempts(tmp_path, monkeypatch):
     assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None
     _open(cluster='c', request='req-1', start=200.0)
     assert get('c', _MILESTONE.INSTANCES_REQUESTED) is None
+
+
+def test_milestone_for_cluster_can_be_keyed_on_the_request(
+        tmp_path, monkeypatch):
+    """With a request id, only that request's attempt answers: a row left
+    open by another (e.g. cancelled) launch of the same cluster must not
+    stand in for this one's."""
+    _fresh_db(tmp_path, monkeypatch)
+    get = global_user_state.get_launch_milestone_for_cluster
+
+    stale = _open(cluster='c', request='req-old', start=100.0)
+    global_user_state.record_launch_milestone(stale,
+                                              _MILESTONE.INSTANCES_REQUESTED,
+                                              110.0)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED,
+               request_id='req-new') is None
+    fresh = _open(cluster='c', request='req-new', start=200.0)
+    global_user_state.record_launch_milestone(fresh,
+                                              _MILESTONE.INSTANCES_REQUESTED,
+                                              210.0)
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED,
+               request_id='req-new') == 210.0
+    assert get('c', _MILESTONE.INSTANCES_REQUESTED,
+               request_id='req-old') == 110.0

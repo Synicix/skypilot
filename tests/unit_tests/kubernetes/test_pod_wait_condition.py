@@ -159,13 +159,52 @@ class TestProbe:
 
     @pytest.mark.parametrize('error', [
         urllib3.exceptions.MaxRetryError(None, '/api/v1/pods'),
-        instance.kubernetes.api_exception()(status=500, reason='boom'),
-        instance.kubernetes.api_exception()(status=403, reason='Forbidden'),
+        instance.kubernetes.api_exception()(status=0, reason='SSL'),
     ])
-    def test_api_error_is_a_missed_poll(self, monkeypatch, error):
+    def test_transport_error_is_a_missed_poll(self, monkeypatch, error):
         _serve(monkeypatch, error)
         condition = _condition(instance.PARK_MODE_ADMISSION)
         assert condition._probe() == (False, None)
+
+    @pytest.mark.parametrize('status', [401, 403, 500])
+    def test_api_error_response_resumes_now(self, monkeypatch, status):
+        """An error response is what the wait itself raises at once; resume
+        so the resumed attempt reports it instead of parking forever on a
+        revoked credential or a broken API server."""
+        _serve(
+            monkeypatch,
+            instance.kubernetes.api_exception()(status=status, reason='denied'))
+        condition = _condition(instance.PARK_MODE_ADMISSION)
+        assert condition._probe() == (True, None)
+
+    def test_persistent_transport_errors_resume_after_grace(self, monkeypatch):
+        """Same budget as the in-worker wait: a streak of transport errors
+        longer than the grace ends the park so the error surfaces."""
+        _serve(monkeypatch, urllib3.exceptions.MaxRetryError(None, '/'))
+        now = [1000.0]
+        monkeypatch.setattr(instance.time, 'time', lambda: now[0])
+        condition = _condition(instance.PARK_MODE_SCHEDULING)
+        grace = instance._POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
+        assert condition._probe()[0] is False
+        now[0] += grace - 1
+        assert condition._probe()[0] is False
+        now[0] += 2
+        assert condition._probe()[0] is True
+
+    def test_transport_error_streak_resets_after_a_good_poll(self, monkeypatch):
+        grace = instance._POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
+        error = urllib3.exceptions.MaxRetryError(None, '/')
+        _serve(monkeypatch, error, [_pod('pod-0', gated=True)], error, error)
+        now = [1000.0]
+        monkeypatch.setattr(instance.time, 'time', lambda: now[0])
+        condition = _condition(instance.PARK_MODE_ADMISSION)
+        assert condition._probe()[0] is False  # error, streak starts
+        now[0] += grace - 1
+        assert condition._probe()[0] is False  # good poll, streak ends
+        now[0] += 2
+        assert condition._probe()[0] is False  # error, new streak
+        now[0] += grace - 1
+        assert condition._probe()[0] is False  # still inside the new grace
 
 
 class TestWait:

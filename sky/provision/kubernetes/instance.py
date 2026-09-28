@@ -327,10 +327,11 @@ class KubernetesPodWaitCondition:
     Deliberately shallow: it resumes on *any* change that the resumed attempt
     has to act on -- admitted or scheduled, a pod gone or being deleted, the
     admission deadline passed -- and leaves every outcome to the resumed
-    _wait_for_pods_to_schedule, which already reports each of them. An API
-    error on a poll is a missed poll: the pods keep their place in the queue
-    regardless, and a persistent error surfaces through the resumed attempt
-    once the executor's fallback reschedules it.
+    _wait_for_pods_to_schedule, which already reports each of them. Errors
+    follow that wait's rules too, so that a park can always end: an error
+    response resumes at once (the resumed attempt raises it), and transport
+    errors are missed polls until a streak outlasts
+    _POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS.
 
     Instances cross the executor's process boundary on the exception, so
     every attribute is plain data.
@@ -353,6 +354,8 @@ class KubernetesPodWaitCondition:
         # Absolute epoch seconds; None waits indefinitely.
         self.deadline = deadline
         self.poll_seconds = poll_seconds
+        # Start of the current streak of transport errors, if any.
+        self._transport_error_since: Optional[float] = None
 
     def _probe(self) -> Tuple[bool, Optional[str]]:
         """One look at the pods: (resume now?, current waiting reason)."""
@@ -366,10 +369,17 @@ class KubernetesPodWaitCondition:
                 _request_timeout=_POD_POLL_REQUEST_TIMEOUT).items
         except (kubernetes.api_exception(),
                 kubernetes.urllib3_http_error()) as e:
+            if not _is_transport_error(e):
+                return True, None
+            now = time.time()
+            if self._transport_error_since is None:
+                self._transport_error_since = now
             logger.debug('Parked launch of cluster '
                          f'{self.cluster_name_on_cloud!r}: pod poll failed, '
                          f'will retry: {common_utils.format_exception(e)}')
-            return False, None
+            return (now - self._transport_error_since >=
+                    _POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS), None
+        self._transport_error_since = None
         pods_by_name = {pod.metadata.name: pod for pod in pods}
         expected = [pods_by_name.get(name) for name in self.expected_pod_names]
         present = [pod for pod in expected if pod is not None]
@@ -443,26 +453,21 @@ def _park_allowed(context: Optional[str], is_ssh_node_pool: bool) -> bool:
             default_value=True))
 
 
-def _gated_wait_anchor(pods: List[Any], expected_pod_names: Set[str],
-                       fallback: float) -> float:
-    """When the admission wait of these pods began, as epoch seconds.
+def _pods_requested_at(cluster_name: str) -> Optional[float]:
+    """When this request's launch attempt asked for its pods, if it has.
 
-    The earliest creation time of the expected pods: unlike the start of this
-    attempt, it survives a park, so a resumed launch keeps the admission
-    budget it already spent instead of starting a new one. Never later than
-    *fallback* (this attempt's start), which also covers pods without a
-    usable creation time.
+    The attempt -- and so this INSTANCES_REQUESTED milestone -- is continued
+    across a park and started afresh by a new request or a failover. That
+    makes it both the moment a resumed launch's admission wait began and the
+    marker that this launch created its pods before it parked. Only a server
+    request can park, so outside one this is always None.
     """
-    anchor = fallback
-    for pod in pods:
-        if pod.metadata.name not in expected_pod_names:
-            continue
-        created = pod.metadata.creation_timestamp
-        if isinstance(created, datetime.datetime):
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=datetime.timezone.utc)
-            anchor = min(anchor, created.timestamp())
-    return anchor
+    if not common_utils.is_in_request_context():
+        return None
+    return global_user_state.get_launch_milestone_for_cluster(
+        cluster_name,
+        global_user_state.LaunchMilestone.INSTANCES_REQUESTED,
+        request_id=common_utils.get_current_request_id())
 
 
 def _get_pvc_name(cluster_name: str, volume_name: str) -> str:
@@ -1358,11 +1363,15 @@ def _wait_for_pods_to_schedule(namespace,
     pods_are_gated = False
     last_gated_pod_names: List[str] = []
     # When the pods entered the gated state in this attempt (for the park
-    # grace), and when their admission wait began across attempts (for the
-    # admission bound; see _gated_wait_anchor). The anchor is set from the
-    # first successful poll.
+    # grace).
     gated_since: Optional[float] = None
-    gated_wait_anchor: Optional[float] = None
+    # When their admission wait began, for the admission bound: when this
+    # request asked for the pods, so a resumed launch keeps the budget it
+    # spent before it parked, and a new request re-using old gated pods (e.g.
+    # after `sky api cancel`) gets its own. Never later than this attempt.
+    requested_at = _pods_requested_at(cluster_name)
+    gated_wait_anchor = (start_time if requested_at is None else min(
+        requested_at, start_time))
     # Start of the current unbroken streak in which every unscheduled pod
     # is Unschedulable (for the park grace under timeout < 0).
     unschedulable_since: Optional[float] = None
@@ -1388,9 +1397,7 @@ def _wait_for_pods_to_schedule(namespace,
         if pods_are_gated:
             if admission_timeout < 0:
                 return True
-            anchor = (gated_wait_anchor
-                      if gated_wait_anchor is not None else start_time)
-            return time.time() < anchor + admission_timeout
+            return time.time() < gated_wait_anchor + admission_timeout
         original_deadline = provision_clock_start + timeout
         # If autoscaling has been detected, extend the deadline from the
         # detection moment. Use max(...) so an explicitly long user timeout
@@ -1422,9 +1429,6 @@ def _wait_for_pods_to_schedule(namespace,
                                 f'{cluster_name_on_cloud}'),
                 _request_timeout=_POD_POLL_REQUEST_TIMEOUT).items
             transport_error_since = None
-            if gated_wait_anchor is None:
-                gated_wait_anchor = _gated_wait_anchor(pods, expected_pod_names,
-                                                       start_time)
         except (kubernetes.api_exception(),
                 kubernetes.urllib3_http_error()) as e:
             # Treat a transport failure as a missed poll and retry within
@@ -1536,7 +1540,6 @@ def _wait_for_pods_to_schedule(namespace,
                 # the queue takes. The pods keep their place in the queue;
                 # the resumed attempt re-enters here with them (see
                 # _create_pods) and carries on from wherever they got to.
-                assert gated_wait_anchor is not None
                 raise exceptions.ExecutionPausedError(
                     'Waiting for queue admission',
                     hint=('The launch resumes automatically once the queue '
@@ -1549,8 +1552,12 @@ def _wait_for_pods_to_schedule(namespace,
                         cluster_name_on_cloud=cluster_name_on_cloud,
                         expected_pod_names=sorted(expected_pod_names),
                         mode=PARK_MODE_ADMISSION,
-                        deadline=(None if admission_timeout < 0 else
-                                  gated_wait_anchor + admission_timeout)))
+                        # The bound _evaluate_timeout applies, and none where
+                        # it applies none (provision_timeout < 0 waits for
+                        # admission indefinitely): a deadline the resumed
+                        # attempt would not enforce only makes it re-park.
+                        deadline=(None if timeout < 0 or admission_timeout < 0
+                                  else gated_wait_anchor + admission_timeout)))
             iteration += 1
             time.sleep(1)
             continue
@@ -2584,9 +2591,7 @@ def _create_pods(region: str, cluster_name: str, cluster_name_on_cloud: str,
     # when it resumes, and its attempt -- continued across the pause, unlike a
     # failover's -- still carries the milestone recorded below. Any of its
     # pods missing now were deleted while it was parked, not never created.
-    resumed_after_park = (global_user_state.get_launch_milestone_for_cluster(
-        cluster_name, global_user_state.LaunchMilestone.INSTANCES_REQUESTED)
-                          is not None)
+    resumed_after_park = _pods_requested_at(cluster_name) is not None
     # Closes the provision-setup segment of this launch attempt and opens the
     # admission-wait one. The same reference point _wait_for_pods_to_schedule
     # measures from, so the two agree. Write-once, so a resumed launch

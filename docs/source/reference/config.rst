@@ -2051,10 +2051,11 @@ admission) for 30 seconds, the launch request is parked: it shows as
 ``WAITING`` in ``sky api status``, frees its API server worker, and, for a
 managed job, frees the jobs controller's launch slot too, so other launches
 are not held up behind queued ones. The pods keep their place in the queue,
-and the launch resumes on its own once they are admitted. The admission wait
-is still bounded by
+and the launch resumes on its own once they are admitted. Parking does not
+change how long a launch waits: the admission wait is still bounded by
 :ref:`kubernetes.kueue.admission_timeout <config-yaml-kubernetes-kueue-admission-timeout>`,
-counted from when the pods were created.
+counted from when the launch first requested its pods, and is unbounded
+when ``provision_timeout`` is ``-1``, as before.
 
 The same applies when
 :ref:`kubernetes.provision_timeout <config-yaml-kubernetes-provision-timeout>`
