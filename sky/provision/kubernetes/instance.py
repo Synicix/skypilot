@@ -1,4 +1,5 @@
 """Kubernetes instance provisioning."""
+import asyncio
 import copy
 import datetime
 import functools
@@ -6,8 +7,8 @@ import json
 import re
 import sys
 import time
-from typing import (Any, Callable, Dict, List, Mapping, NamedTuple, Optional,
-                    Set, Tuple, TYPE_CHECKING, Union)
+from typing import (Any, Awaitable, Callable, Dict, List, Mapping, NamedTuple,
+                    Optional, Set, Tuple, TYPE_CHECKING, Union)
 
 from sky import exceptions
 from sky import global_user_state
@@ -268,6 +269,134 @@ def _pod_is_scheduled(pod) -> bool:
         if condition.type == 'PodScheduled' and condition.status == 'True':
             return True
     return False
+
+
+def _unschedulable_message(pod) -> Optional[str]:
+    """The scheduler's explanation for a pod it cannot place, if any."""
+    for condition in (pod.status.conditions or []):
+        if (condition.type == 'PodScheduled' and
+                condition.status == 'False' and
+                condition.reason == 'Unschedulable'):
+            return condition.message or condition.reason
+    return None
+
+
+# What a parked launch is waiting for (see KubernetesPodWaitCondition).
+PARK_MODE_ADMISSION = 'admission'
+PARK_MODE_SCHEDULING = 'scheduling'
+
+
+class KubernetesPodWaitCondition:
+    """Resume a parked launch once its pods stop waiting.
+
+    Attached to the ``exceptions.ExecutionPausedError`` that
+    _wait_for_pods_to_schedule raises when a launch would otherwise sit in an
+    executor worker for as long as a queue takes to admit its pods (mode
+    ``admission``: pods held by a scheduling gate, e.g. Kueue's) or the
+    scheduler takes to find room for them (mode ``scheduling``: pods
+    Unschedulable under an indefinite provision_timeout). Implements the
+    duck-typed continue-condition contract (see
+    ``sky/server/requests/continue_condition.py``), including ``wait_async``,
+    so any number of parked launches cost coroutines rather than threads.
+
+    Deliberately shallow: it resumes on *any* change that the resumed attempt
+    has to act on -- admitted or scheduled, a pod gone or being deleted, the
+    admission deadline passed -- and leaves every outcome to the resumed
+    _wait_for_pods_to_schedule, which already reports each of them. An API
+    error on a poll is a missed poll: the pods keep their place in the queue
+    regardless, and a persistent error surfaces through the resumed attempt
+    once the executor's fallback reschedules it.
+
+    Instances cross the executor's process boundary on the exception, so
+    every attribute is plain data.
+    """
+
+    def __init__(self,
+                 *,
+                 context: Optional[str],
+                 namespace: str,
+                 cluster_name_on_cloud: str,
+                 expected_pod_names: List[str],
+                 mode: str,
+                 deadline: Optional[float],
+                 poll_seconds: float = 10.0) -> None:
+        self.context = context
+        self.namespace = namespace
+        self.cluster_name_on_cloud = cluster_name_on_cloud
+        self.expected_pod_names = list(expected_pod_names)
+        self.mode = mode
+        # Absolute epoch seconds; None waits indefinitely.
+        self.deadline = deadline
+        self.poll_seconds = poll_seconds
+
+    def _probe(self) -> Tuple[bool, Optional[str]]:
+        """One look at the pods: (resume now?, current waiting reason)."""
+        if self.deadline is not None and time.time() >= self.deadline:
+            return True, None
+        try:
+            pods = kubernetes.core_api(self.context).list_namespaced_pod(
+                self.namespace,
+                label_selector=(f'{constants.TAG_SKYPILOT_CLUSTER_NAME}='
+                                f'{self.cluster_name_on_cloud}'),
+                _request_timeout=_POD_POLL_REQUEST_TIMEOUT).items
+        except (kubernetes.api_exception(),
+                kubernetes.urllib3_http_error()) as e:
+            logger.debug('Parked launch of cluster '
+                         f'{self.cluster_name_on_cloud!r}: pod poll failed, '
+                         f'will retry: {common_utils.format_exception(e)}')
+            return False, None
+        pods_by_name = {pod.metadata.name: pod for pod in pods}
+        expected = [pods_by_name.get(name) for name in self.expected_pod_names]
+        if any(pod is None or pod.metadata.deletion_timestamp is not None
+               for pod in expected):
+            return True, None
+        if self.mode == PARK_MODE_ADMISSION:
+            return not any(pod.spec.scheduling_gates for pod in expected), None
+        unscheduled = [pod for pod in expected if not _pod_is_scheduled(pod)]
+        if not unscheduled:
+            return True, None
+        return False, _unschedulable_message(unscheduled[0])
+
+    def wait(self,
+             *,
+             is_cancelled: Callable[[], bool],
+             fallback_wait_seconds: float,
+             update_status_msg: Optional[Callable[[str], None]] = None) -> bool:
+        del fallback_wait_seconds  # The pods are the signal.
+        last_reason: Optional[str] = None
+        while True:
+            if is_cancelled():
+                return False
+            resume, reason = self._probe()
+            if resume:
+                return True
+            if (update_status_msg is not None and reason is not None and
+                    reason != last_reason):
+                update_status_msg(reason)
+                last_reason = reason
+            time.sleep(self.poll_seconds)
+
+    async def wait_async(
+        self,
+        *,
+        is_cancelled: Callable[[], Awaitable[bool]],
+        fallback_wait_seconds: float,
+        update_status_msg: Optional[Callable[[str], Awaitable[None]]] = None
+    ) -> bool:
+        del fallback_wait_seconds  # The pods are the signal.
+        loop = asyncio.get_running_loop()
+        last_reason: Optional[str] = None
+        while True:
+            if await is_cancelled():
+                return False
+            resume, reason = await loop.run_in_executor(None, self._probe)
+            if resume:
+                return True
+            if (update_status_msg is not None and reason is not None and
+                    reason != last_reason):
+                await update_status_msg(reason)
+                last_reason = reason
+            await asyncio.sleep(self.poll_seconds)
 
 
 def _get_pvc_name(cluster_name: str, volume_name: str) -> str:
