@@ -1720,6 +1720,11 @@ _CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
             }
         },
     },
+    # Whether a launch waiting on queue admission parks (frees its API
+    # server worker) instead of holding it for the whole wait.
+    'park_queued_launches': {
+        'type': 'boolean',
+    },
     'kueue': {
         'type': 'object',
         'required': [],

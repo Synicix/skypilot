@@ -2094,6 +2094,237 @@ class TestWaitForPodsToScheduleQueueGating:
         assert not raise_errors.called
 
 
+class TestWaitForPodsToScheduleParking:
+    """Parking a launch that is only waiting, instead of holding a worker.
+
+    The production bug (PLT-3425, PLT-3594): a launch whose pods wait for
+    queue admission slept inside an API-server executor worker for the
+    whole wait, up to 24 hours, and the jobs controller held a launch slot
+    for it too. Enough queued launches filled both pools and every other
+    launch on the server hung behind them. Inside a server request the wait
+    now raises ExecutionPausedError: the request parks as WAITING, frees the
+    worker (and, via the controller's park handling, the launch slot), and
+    resumes when KubernetesPodWaitCondition sees the pods move.
+    """
+
+    _FakeClock = TestWaitForPodsToScheduleAutoscaleTimeout._FakeClock
+    _make_node = staticmethod(
+        TestWaitForPodsToScheduleAutoscaleTimeout._make_node)
+    _make_pending_pod = staticmethod(
+        TestWaitForPodsToScheduleAutoscaleTimeout._make_pending_pod)
+    _add_gate = staticmethod(TestWaitForPodsToScheduleQueueGating._add_gate)
+
+    @staticmethod
+    def _unschedulable(pod, message='0/3 nodes are available'):
+        condition = mock.MagicMock()
+        condition.type = 'PodScheduled'
+        condition.status = 'False'
+        condition.reason = 'Unschedulable'
+        condition.message = message
+        pod.status.conditions = [condition]
+        return pod
+
+    def _setup(self,
+               monkeypatch,
+               pod_timeline,
+               *,
+               in_request=True,
+               config=None,
+               start=0.0):
+        """Serve pods by simulated time; *pod_timeline* is a list of
+        (since, [pods]). *config* maps config keys to values."""
+        config = dict(config or {})
+
+        def mock_config(cloud, region, keys, default_value=None, **kwargs):
+            del cloud, region, kwargs
+            return config.get(keys, default_value)
+
+        monkeypatch.setattr('sky.skypilot_config.get_effective_region_config',
+                            mock_config)
+        monkeypatch.setattr(instance.common_utils, 'is_in_request_context',
+                            lambda: in_request)
+
+        clock = self._FakeClock()
+        clock.now = start
+
+        def sleep(secs):
+            clock.sleep(secs)
+            # A wait that should have parked but did not would otherwise
+            # spin for as long as its (possibly indefinite) bound.
+            if clock.now > start + 10_000:
+                raise AssertionError('wait did not end by simulated '
+                                     f't={clock.now}')
+
+        monkeypatch.setattr(instance.time, 'time', clock.time)
+        monkeypatch.setattr(instance.time, 'sleep', sleep)
+
+        def list_pods(namespace, label_selector=None, **kwargs):
+            del namespace, label_selector, kwargs
+            current = pod_timeline[0][1]
+            for since, pods in pod_timeline:
+                if clock.now >= since:
+                    current = pods
+            result = mock.MagicMock()
+            result.items = current
+            return result
+
+        core_api = mock.MagicMock()
+        core_api.list_namespaced_pod.side_effect = list_pods
+        monkeypatch.setattr('sky.adaptors.kubernetes.core_api',
+                            lambda *a, **kw: core_api)
+        raise_errors = mock.MagicMock(
+            side_effect=config_lib.KubernetesError('simulated-timeout'))
+        monkeypatch.setattr(instance, '_raise_pod_scheduling_errors',
+                            raise_errors)
+        monkeypatch.setattr('sky.utils.rich_utils.force_update_status',
+                            lambda *a, **kw: None)
+        add_event = mock.MagicMock()
+        monkeypatch.setattr(instance.global_user_state, 'add_cluster_event',
+                            add_event)
+        return clock, raise_errors, add_event
+
+    def _wait(self, names=('pod-0',), timeout=5, admission_timeout=300):
+        # admission_timeout is bounded so that a regression that stops
+        # parking fails the test in 300 simulated seconds instead of
+        # spinning through the 24-hour default.
+        instance._wait_for_pods_to_schedule(
+            namespace='ns',
+            context='test-context',
+            new_nodes=[self._make_node(n, 'my-cluster') for n in names],
+            timeout=timeout,
+            cluster_name='cn',
+            create_pods_start=datetime.datetime.now(datetime.timezone.utc),
+            admission_timeout=admission_timeout)
+
+    def _gated(self, name='pod-0'):
+        return self._add_gate(self._make_pending_pod(name, 'my-cluster'))
+
+    def _running(self, name='pod-0'):
+        pod = self._make_pending_pod(name, 'my-cluster')
+        pod.status.phase = 'Running'
+        return pod
+
+    # --- Queue admission -------------------------------------------------
+
+    def test_parks_after_gate_grace(self, monkeypatch):
+        clock, _, add_event = self._setup(monkeypatch, [(0.0, [self._gated()])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait()
+        assert (instance._PARK_AFTER_GATED_SECONDS <= clock.now <
+                instance._PARK_AFTER_GATED_SECONDS + 2)
+        err = info.value
+        assert 'Waiting for queue admission' in str(err)
+        assert err.retry_wait_seconds == 30
+        condition = err.continue_condition
+        assert isinstance(condition, instance.KubernetesPodWaitCondition)
+        assert condition.mode == instance.PARK_MODE_ADMISSION
+        assert condition.expected_pod_names == ['pod-0']
+        assert condition.cluster_name_on_cloud == 'my-cluster'
+        assert condition.namespace == 'ns'
+        assert condition.context == 'test-context'
+        # The queue wait is still recorded before the launch parks, so the
+        # cluster's status detail says what it is waiting for.
+        assert any('queue admission' in c.kwargs.get('reason', '')
+                   for c in add_event.call_args_list)
+
+    def test_no_park_when_admitted_within_grace(self, monkeypatch):
+        self._setup(monkeypatch, [(0.0, [self._gated()]),
+                                  (10.0, [self._running()])])
+        self._wait()  # Returns normally: admitted before the grace ran out.
+
+    def test_no_park_outside_request_context(self, monkeypatch):
+        """Nothing outside a server request can reschedule a paused launch;
+        raising there would be an unhandled error. Keep today's wait."""
+        clock, _, _ = self._setup(monkeypatch, [(0.0, [self._gated()])],
+                                  in_request=False)
+        with pytest.raises(config_lib.KubernetesError,
+                           match='scheduling gates'):
+            self._wait(admission_timeout=100)
+        assert clock.now >= 100
+
+    def test_no_park_when_config_disabled(self, monkeypatch):
+        clock, _, _ = self._setup(monkeypatch, [(0.0, [self._gated()])],
+                                  config={('park_queued_launches',): False})
+        with pytest.raises(config_lib.KubernetesError,
+                           match='scheduling gates'):
+            self._wait(admission_timeout=100)
+        assert clock.now >= 100
+
+    def test_park_deadline_anchored_at_pod_creation(self, monkeypatch):
+        """The admission budget is counted from when the pods were created,
+        which survives a park, not from when this attempt started."""
+        pod = self._gated()
+        pod.metadata.creation_timestamp = datetime.datetime(
+            1970, 1, 1, tzinfo=datetime.timezone.utc)
+        self._setup(monkeypatch, [(0.0, [pod])], start=50.0)
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(admission_timeout=100)
+        assert info.value.continue_condition.deadline == 100.0
+
+    def test_resume_after_deadline_raises_admission_error(self, monkeypatch):
+        """A resumed attempt past the original deadline fails at once with
+        the admission error instead of starting a fresh budget."""
+        pod = self._gated()
+        pod.metadata.creation_timestamp = datetime.datetime(
+            1970, 1, 1, tzinfo=datetime.timezone.utc)
+        clock, _, _ = self._setup(monkeypatch, [(0.0, [pod])], start=101.0)
+        with pytest.raises(config_lib.KubernetesError,
+                           match='scheduling gates'):
+            self._wait(admission_timeout=100)
+        assert clock.now < 105
+
+    def test_naive_creation_timestamp_is_utc(self, monkeypatch):
+        pod = self._gated()
+        pod.metadata.creation_timestamp = datetime.datetime(1970, 1, 1, 0, 0,
+                                                            10)
+        self._setup(monkeypatch, [(0.0, [pod])], start=50.0)
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(admission_timeout=100)
+        assert info.value.continue_condition.deadline == 110.0
+
+    def test_admission_timeout_negative_gives_no_deadline(self, monkeypatch):
+        self._setup(monkeypatch, [(0.0, [self._gated()])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(admission_timeout=-1)
+        assert info.value.continue_condition.deadline is None
+
+    def test_partially_gated_group_parks(self, monkeypatch):
+        """A pod group admitted in part is still a queue wait."""
+        ungated = self._make_pending_pod('pod-1', 'my-cluster')
+        self._setup(monkeypatch, [(0.0, [self._gated('pod-0'), ungated])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(names=('pod-0', 'pod-1'))
+        assert info.value.continue_condition.expected_pod_names == [
+            'pod-0', 'pod-1'
+        ]
+
+    def test_deleted_pod_during_gate_still_errors(self, monkeypatch):
+        """A deleted pod is reported with its reason; it is not parked."""
+        pod = self._gated()
+        pod.metadata.deletion_timestamp = datetime.datetime.now(
+            datetime.timezone.utc)
+        self._setup(monkeypatch, [(0.0, [pod])])
+        monkeypatch.setattr(
+            instance, '_deleted_pods_error',
+            lambda **kwargs: config_lib.KubernetesError('pods were deleted'))
+        # timeout=60 outlasts the missing-pod grace, so the deleted-pods
+        # path is what ends the wait.
+        with pytest.raises(config_lib.KubernetesError,
+                           match='pods were deleted'):
+            self._wait(timeout=60)
+
+    def test_run_instances_propagates_pause(self, monkeypatch):
+        """run_instances re-raises only Kubernetes errors after logging;
+        the pause must reach the provisioner untouched."""
+        pause = sky_exceptions.ExecutionPausedError('Waiting for queue '
+                                                    'admission', 'hint', 30)
+        monkeypatch.setattr(instance, '_create_pods',
+                            mock.MagicMock(side_effect=pause))
+        with pytest.raises(sky_exceptions.ExecutionPausedError):
+            instance.run_instances('region', 'cn', 'my-cluster',
+                                   mock.MagicMock())
+
+
 class TestWaitForPodsToScheduleTransportErrors:
     """Transport failures of the pod poll must not wedge or kill the wait.
 

@@ -2038,6 +2038,28 @@ when this field is not set they wait for admission indefinitely instead of
 failing after 24 hours and re-entering the queue at the back. Set the field
 explicitly to bound their wait as well.
 
+.. _config-yaml-kubernetes-park-queued-launches:
+
+``kubernetes.park_queued_launches``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Whether a launch that is waiting for queue admission gives back its API
+server worker while it waits (optional).
+
+When a launch's pods have been held by a scheduling gate (e.g. Kueue
+admission) for 30 seconds, the launch request is parked: it shows as
+``WAITING`` in ``sky api status``, frees its API server worker, and, for a
+managed job, frees the jobs controller's launch slot too, so other launches
+are not held up behind queued ones. The pods keep their place in the queue,
+and the launch resumes on its own once they are admitted. The admission wait
+is still bounded by
+:ref:`kubernetes.kueue.admission_timeout <config-yaml-kubernetes-kueue-admission-timeout>`,
+counted from when the pods were created.
+
+Set to ``false`` to keep the launch in its worker for the whole wait.
+
+Default: ``true``.
+
 .. _config-yaml-kubernetes-dws:
 
 ``kubernetes.dws``

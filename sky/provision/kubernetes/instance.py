@@ -75,6 +75,15 @@ _AUTOSCALE_INITIAL_MIN_TIMEOUT_SECONDS = 60
 # knob's default (matching the default provision_timeout applied when a
 # Kueue local queue is configured); -1 waits indefinitely.
 _QUEUE_ADMISSION_TIMEOUT_SECONDS = 24 * 60 * 60  # 24 hours
+# Inside an API-server request, a launch whose pods stay held by a
+# scheduling gate this long parks (ExecutionPausedError) instead of waiting in
+# its executor worker: the request goes WAITING, the worker -- and the jobs
+# controller's launch slot for it -- are freed, and KubernetesPodWaitCondition
+# resumes it once the pods move. The grace keeps a queue that admits within
+# seconds from paying for a park and a resume.
+_PARK_AFTER_GATED_SECONDS = 30
+# Fallback wait for the executor if the condition itself fails.
+_PARK_RETRY_WAIT_SECONDS = 30
 # Request timeout for the pod polling loops (_wait_for_pods_to_schedule /
 # _wait_for_pods_to_run): (connect, read) seconds. Without a request timeout,
 # a connection that stops receiving data without being closed (e.g. silently
@@ -397,6 +406,42 @@ class KubernetesPodWaitCondition:
                 await update_status_msg(reason)
                 last_reason = reason
             await asyncio.sleep(self.poll_seconds)
+
+
+def _park_allowed(context: Optional[str], is_ssh_node_pool: bool) -> bool:
+    """Whether a waiting launch may park instead of holding its worker.
+
+    Only a server request can be parked and rescheduled; anywhere else the
+    pause would surface as an unhandled error.
+    """
+    if not common_utils.is_in_request_context():
+        return False
+    return bool(
+        skypilot_config.get_effective_region_config(
+            cloud='ssh' if is_ssh_node_pool else 'kubernetes',
+            region=context,
+            keys=('park_queued_launches',),
+            default_value=True))
+
+
+def _gated_wait_anchor(pods: List[Any], expected_pod_names: Set[str],
+                       fallback: float) -> float:
+    """When the admission wait of these pods began, as epoch seconds.
+
+    The earliest creation time of the expected pods: unlike the start of this
+    attempt, it survives a park, so a resumed launch keeps the admission
+    budget it already spent instead of starting a new one. Never later than
+    *fallback* (this attempt's start), which also covers pods without a
+    usable creation time.
+    """
+    anchor = fallback
+    for pod in pods:
+        if pod.metadata.name not in expected_pod_names:
+            continue
+        created = pod.metadata.creation_timestamp
+        if isinstance(created, datetime.datetime):
+            anchor = min(anchor, _utc(created).timestamp())
+    return anchor
 
 
 def _get_pvc_name(cluster_name: str, volume_name: str) -> str:
@@ -1291,6 +1336,12 @@ def _wait_for_pods_to_schedule(namespace,
             default_value=_QUEUE_ADMISSION_TIMEOUT_SECONDS)
     pods_are_gated = False
     last_gated_pod_names: List[str] = []
+    # When the pods entered the gated state in this attempt (for the park
+    # grace), and when their admission wait began across attempts (for the
+    # admission bound; see _gated_wait_anchor). The anchor is set from the
+    # first successful poll.
+    gated_since: Optional[float] = None
+    gated_wait_anchor: Optional[float] = None
     # When each expected pod was first found missing -- absent from the pod
     # list, or listed with a deletion timestamp -- in its current streak. A
     # pod that is listed again, and not being deleted, drops out, so every pod
@@ -1313,7 +1364,9 @@ def _wait_for_pods_to_schedule(namespace,
         if pods_are_gated:
             if admission_timeout < 0:
                 return True
-            return time.time() < start_time + admission_timeout
+            anchor = (gated_wait_anchor
+                      if gated_wait_anchor is not None else start_time)
+            return time.time() < anchor + admission_timeout
         original_deadline = provision_clock_start + timeout
         # If autoscaling has been detected, extend the deadline from the
         # detection moment. Use max(...) so an explicitly long user timeout
@@ -1345,6 +1398,10 @@ def _wait_for_pods_to_schedule(namespace,
                                 f'{cluster_name_on_cloud}'),
                 _request_timeout=_POD_POLL_REQUEST_TIMEOUT).items
             transport_error_since = None
+            if gated_wait_anchor is None:
+                gated_wait_anchor = _gated_wait_anchor(pods,
+                                                       expected_pod_names,
+                                                       start_time)
         except (kubernetes.api_exception(),
                 kubernetes.urllib3_http_error()) as e:
             # Treat a transport failure as a missed poll and retry within
@@ -1420,6 +1477,7 @@ def _wait_for_pods_to_schedule(namespace,
         if gated_pod_names:
             if not pods_are_gated:
                 pods_are_gated = True
+                gated_since = time.time()
                 logger.info(f'Pod(s) {sorted(gated_pod_names)} are held by '
                             'scheduling gates, waiting for queue admission; '
                             'provision_timeout will apply after admission.')
@@ -1448,6 +1506,28 @@ def _wait_for_pods_to_schedule(namespace,
                                     namespace=namespace,
                                     cluster_name_on_cloud=cluster_name_on_cloud,
                                     cluster_name=cluster_name)
+            assert gated_since is not None
+            if (time.time() - gated_since >= _PARK_AFTER_GATED_SECONDS and
+                    _park_allowed(context, is_ssh_node_pool)):
+                # Park rather than hold this executor worker for as long as
+                # the queue takes. The pods keep their place in the queue;
+                # the resumed attempt re-enters here with them (see
+                # _create_pods) and carries on from wherever they got to.
+                assert gated_wait_anchor is not None
+                raise exceptions.ExecutionPausedError(
+                    'Waiting for queue admission',
+                    hint=('The launch resumes automatically once the queue '
+                          'admits its pods. To see the queue: '
+                          f'kubectl describe workloads -n {namespace}'),
+                    retry_wait_seconds=_PARK_RETRY_WAIT_SECONDS,
+                    continue_condition=KubernetesPodWaitCondition(
+                        context=context,
+                        namespace=namespace,
+                        cluster_name_on_cloud=cluster_name_on_cloud,
+                        expected_pod_names=sorted(expected_pod_names),
+                        mode=PARK_MODE_ADMISSION,
+                        deadline=(None if admission_timeout < 0 else
+                                  gated_wait_anchor + admission_timeout)))
             iteration += 1
             time.sleep(1)
             continue
@@ -1455,6 +1535,7 @@ def _wait_for_pods_to_schedule(namespace,
             # All expected pods were just admitted (gates removed) — start
             # the provisioning clock now.
             pods_are_gated = False
+            gated_since = None
             provision_clock_start = time.time()
             logger.info('All pods admitted (scheduling gates removed); '
                         f'waiting up to {timeout}s for scheduling.')

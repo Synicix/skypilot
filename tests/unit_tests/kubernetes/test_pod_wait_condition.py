@@ -17,6 +17,8 @@ import urllib3
 
 from sky.provision import constants as prov_constants
 from sky.provision.kubernetes import instance
+from sky.utils import common_utils
+from sky.utils import schemas
 
 _CLUSTER = 'my-cluster-2ea4'
 
@@ -310,3 +312,32 @@ def test_condition_is_async_capable():
     thread per parked request) only when it is a coroutine function."""
     assert asyncio.iscoroutinefunction(
         instance.KubernetesPodWaitCondition.wait_async)
+
+
+@pytest.mark.parametrize('config', [
+    {
+        'kubernetes': {
+            'park_queued_launches': False
+        }
+    },
+    {
+        'kubernetes': {
+            'context_configs': {
+                'kind-q': {
+                    'park_queued_launches': True
+                }
+            }
+        }
+    },
+])
+def test_park_queued_launches_is_valid_config(config):
+    common_utils.validate_schema(config, schemas.get_config_schema(),
+                                 'Invalid config YAML: ')
+
+
+def test_park_queued_launches_must_be_boolean():
+    with pytest.raises(ValueError, match='park_queued_launches'):
+        common_utils.validate_schema(
+            {'kubernetes': {
+                'park_queued_launches': 'yes'
+            }}, schemas.get_config_schema(), 'Invalid config YAML: ')
