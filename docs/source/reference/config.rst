@@ -2056,6 +2056,13 @@ is still bounded by
 :ref:`kubernetes.kueue.admission_timeout <config-yaml-kubernetes-kueue-admission-timeout>`,
 counted from when the pods were created.
 
+The same applies when
+:ref:`kubernetes.provision_timeout <config-yaml-kubernetes-provision-timeout>`
+is ``-1`` and the scheduler has reported the pods ``Unschedulable`` for 60
+seconds: the launch parks until they are scheduled. With a finite
+``provision_timeout`` the launch waits in its worker and fails over at the
+timeout as usual.
+
 Set to ``false`` to keep the launch in its worker for the whole wait.
 
 Default: ``true``.

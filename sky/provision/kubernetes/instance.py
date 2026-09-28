@@ -82,6 +82,12 @@ _QUEUE_ADMISSION_TIMEOUT_SECONDS = 24 * 60 * 60  # 24 hours
 # resumes it once the pods move. The grace keeps a queue that admits within
 # seconds from paying for a park and a resume.
 _PARK_AFTER_GATED_SECONDS = 30
+# Likewise for pods the scheduler keeps reporting Unschedulable, but only
+# under an indefinite provision_timeout: there is no failover deadline to
+# keep, so the wait is a queue for capacity in all but name. Longer than the
+# gate grace because Unschedulable is also what a pod reports for the moments
+# before a node frees up or an autoscaler reacts.
+_PARK_AFTER_UNSCHEDULABLE_SECONDS = 60
 # Fallback wait for the executor if the condition itself fails.
 _PARK_RETRY_WAIT_SECONDS = 30
 # Request timeout for the pod polling loops (_wait_for_pods_to_schedule /
@@ -290,6 +296,17 @@ def _unschedulable_message(pod) -> Optional[str]:
     return None
 
 
+def _scheduling_wait_message(unschedulable_msg: Optional[str]) -> str:
+    """Status message of a launch parked on Unschedulable pods.
+
+    Shared by the park and the condition's refreshes, so the status reads
+    the same before and after the scheduler's reason changes.
+    """
+    if unschedulable_msg:
+        return f'Waiting for pods to be scheduled: {unschedulable_msg}'
+    return 'Waiting for pods to be scheduled'
+
+
 # What a parked launch is waiting for (see KubernetesPodWaitCondition).
 PARK_MODE_ADMISSION = 'admission'
 PARK_MODE_SCHEDULING = 'scheduling'
@@ -364,7 +381,8 @@ class KubernetesPodWaitCondition:
         unscheduled = [pod for pod in expected if not _pod_is_scheduled(pod)]
         if not unscheduled:
             return True, None
-        return False, _unschedulable_message(unscheduled[0])
+        return False, _scheduling_wait_message(
+            _unschedulable_message(unscheduled[0]))
 
     def wait(self,
              *,
@@ -1342,6 +1360,9 @@ def _wait_for_pods_to_schedule(namespace,
     # first successful poll.
     gated_since: Optional[float] = None
     gated_wait_anchor: Optional[float] = None
+    # Start of the current unbroken streak in which every unscheduled pod
+    # is Unschedulable (for the park grace under timeout < 0).
+    unschedulable_since: Optional[float] = None
     # When each expected pod was first found missing -- absent from the pod
     # list, or listed with a deletion timestamp -- in its current streak. A
     # pod that is listed again, and not being deleted, drops out, so every pod
@@ -1657,6 +1678,39 @@ def _wait_for_pods_to_schedule(namespace,
                     namespace=namespace,
                     cluster_name_on_cloud=cluster_name_on_cloud,
                     cluster_name=cluster_name)
+
+        # Under an indefinite provision_timeout, pods that stay Unschedulable
+        # are waiting for capacity to free up, which can take as long as a
+        # queue; park instead of holding the worker (see
+        # _PARK_AFTER_UNSCHEDULABLE_SECONDS). A volume wait or a scale-up in
+        # flight keeps the worker: both have their own diagnostics and ends.
+        if (timeout < 0 and volume_wait_msg is None and
+                not scale_up_in_flight and
+                all(_unschedulable_message(pod) is not None
+                    for pod in unscheduled_pods)):
+            if unschedulable_since is None:
+                unschedulable_since = time.time()
+            if (time.time() - unschedulable_since >=
+                    _PARK_AFTER_UNSCHEDULABLE_SECONDS and
+                    _park_allowed(context, is_ssh_node_pool)):
+                raise exceptions.ExecutionPausedError(
+                    _scheduling_wait_message(
+                        _unschedulable_message(unscheduled_pods[0])),
+                    hint=('The launch resumes automatically once the pods '
+                          'are scheduled. To see why they are not: '
+                          f'kubectl describe pods -n {namespace} '
+                          f'-l {constants.TAG_SKYPILOT_CLUSTER_NAME}='
+                          f'{cluster_name_on_cloud}'),
+                    retry_wait_seconds=_PARK_RETRY_WAIT_SECONDS,
+                    continue_condition=KubernetesPodWaitCondition(
+                        context=context,
+                        namespace=namespace,
+                        cluster_name_on_cloud=cluster_name_on_cloud,
+                        expected_pod_names=sorted(expected_pod_names),
+                        mode=PARK_MODE_SCHEDULING,
+                        deadline=None))
+        else:
+            unschedulable_since = None
 
         iteration += 1
         time.sleep(1)

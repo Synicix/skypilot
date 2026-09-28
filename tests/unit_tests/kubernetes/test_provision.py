@@ -2313,6 +2313,92 @@ class TestWaitForPodsToScheduleParking:
                            match='pods were deleted'):
             self._wait(timeout=60)
 
+    # --- Unschedulable under an indefinite provision_timeout --------------
+
+    def _unschedulable_pod(self, message='0/3 nodes are available'):
+        return self._unschedulable(
+            self._make_pending_pod('pod-0', 'my-cluster'), message)
+
+    def test_parks_unschedulable_with_infinite_timeout(self, monkeypatch):
+        """provision_timeout=-1 already waits forever; parking changes only
+        where the wait happens, not whether the launch fails over."""
+        clock, raise_errors, _ = self._setup(
+            monkeypatch, [(0.0, [self._unschedulable_pod()])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(timeout=-1)
+        assert (instance._PARK_AFTER_UNSCHEDULABLE_SECONDS <= clock.now <
+                instance._PARK_AFTER_UNSCHEDULABLE_SECONDS + 2)
+        err = info.value
+        assert str(err) == ('Waiting for pods to be scheduled: '
+                            '0/3 nodes are available')
+        assert err.retry_wait_seconds == 30
+        assert err.continue_condition.mode == instance.PARK_MODE_SCHEDULING
+        assert err.continue_condition.deadline is None
+        assert not raise_errors.called
+
+    def test_no_park_unschedulable_with_finite_timeout(self, monkeypatch):
+        """A finite provision_timeout is a failover deadline; keep it in
+        the worker so failover behaves exactly as before."""
+        clock, raise_errors, _ = self._setup(
+            monkeypatch, [(0.0, [self._unschedulable_pod()])])
+        with pytest.raises(config_lib.KubernetesError,
+                           match='simulated-timeout'):
+            self._wait(timeout=120)
+        assert clock.now >= 120
+        assert raise_errors.called
+
+    def test_no_park_unschedulable_outside_request_context(self, monkeypatch):
+        clock, _, _ = self._setup(monkeypatch,
+                                  [(0.0, [self._unschedulable_pod()]),
+                                   (300.0, [self._running()])],
+                                  in_request=False)
+        self._wait(timeout=-1)
+        assert clock.now >= 300
+
+    def test_no_park_pending_without_unschedulable_reason(self, monkeypatch):
+        """A pod the scheduler has not yet ruled on is not a queue."""
+        clock, _, _ = self._setup(
+            monkeypatch,
+            [(0.0, [self._make_pending_pod('pod-0', 'my-cluster')]),
+             (300.0, [self._running()])])
+        self._wait(timeout=-1)
+        assert clock.now >= 300
+
+    def test_unschedulable_streak_resets(self, monkeypatch):
+        """The grace runs from the start of an unbroken Unschedulable
+        streak, not from the first time the pod was ever Unschedulable."""
+        clock, _, _ = self._setup(
+            monkeypatch,
+            [(0.0, [self._unschedulable_pod()]),
+             (40.0, [self._make_pending_pod('pod-0', 'my-cluster')]),
+             (50.0, [self._unschedulable_pod()])])
+        with pytest.raises(sky_exceptions.ExecutionPausedError):
+            self._wait(timeout=-1)
+        assert clock.now >= 50 + instance._PARK_AFTER_UNSCHEDULABLE_SECONDS
+
+    def test_no_park_while_volume_pending(self, monkeypatch):
+        """A volume wait has its own diagnostics; keep it in the worker."""
+        clock, _, _ = self._setup(monkeypatch,
+                                  [(0.0, [self._unschedulable_pod()]),
+                                   (300.0, [self._running()])])
+        monkeypatch.setattr(instance._PendingVolumeProbe, 'probe',
+                            lambda self, pods, hold_failures: 'waiting for '
+                            'volume data to bind')
+        self._wait(timeout=-1)
+        assert clock.now >= 300
+
+    def test_no_park_while_scale_up_in_flight(self, monkeypatch):
+        """An autoscaler adding a node is capacity on its way, not a
+        queue; the wait's own autoscaler handling owns it."""
+        clock, _, _ = self._setup(monkeypatch,
+                                  [(0.0, [self._unschedulable_pod()]),
+                                   (800.0, [self._running()])],
+                                  config={('autoscaler',): 'gke'})
+        monkeypatch.setattr(instance, '_cluster_had_autoscale_event',
+                            lambda *args, **kwargs: True)
+        self._wait(timeout=-1)
+        assert clock.now >= 800
+
     def test_run_instances_propagates_pause(self, monkeypatch):
         """run_instances re-raises only Kubernetes errors after logging;
         the pause must reach the provisioner untouched."""

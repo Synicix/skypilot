@@ -130,7 +130,8 @@ class TestProbe:
                 _pod('pod-1', scheduled=True)])
         condition = _condition(instance.PARK_MODE_SCHEDULING,
                                pods=('pod-0', 'pod-1'))
-        assert condition._probe() == (False, '0/3 nodes are available')
+        assert condition._probe() == (
+            False, 'Waiting for pods to be scheduled: 0/3 nodes are available')
         assert condition._probe()[0] is True
 
     @pytest.mark.parametrize(
@@ -234,7 +235,12 @@ class TestWait:
             fallback_wait_seconds=30,
             update_status_msg=update_status_msg)
         assert result is True
-        assert reasons == ['a', 'b']
+        # Same wording as the message the launch parked with, so the status
+        # reads the same before and after a refresh.
+        assert reasons == [
+            'Waiting for pods to be scheduled: a',
+            'Waiting for pods to be scheduled: b'
+        ]
 
     @pytest.mark.asyncio
     async def test_wait_async_without_update_status_msg(
@@ -281,7 +287,10 @@ class TestWait:
                 update_status_msg=update_status_msg))
 
         assert sync_result is async_result is True
-        assert sync_reasons == async_reasons == ['a', 'b']
+        assert sync_reasons == async_reasons == [
+            'Waiting for pods to be scheduled: a',
+            'Waiting for pods to be scheduled: b'
+        ]
         assert sync_sleeps == no_sleep == [10.0, 10.0]
         assert (sync_api.list_namespaced_pod.call_count ==
                 async_api.list_namespaced_pod.call_count == 3)
