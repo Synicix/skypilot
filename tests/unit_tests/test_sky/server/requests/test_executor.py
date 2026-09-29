@@ -15,6 +15,7 @@ import pytest
 from sky import exceptions
 from sky import global_user_state
 from sky import skypilot_config
+from sky.provision.kubernetes import pod_wait_condition
 from sky.server import config as server_config
 from sky.server import constants as server_constants
 from sky.server import daemons as server_daemons
@@ -1241,6 +1242,58 @@ def test_pause_async_wait_does_not_hold_the_monitor_thread(pause_harness):
     condition.release.set()
     assert pause_harness.queued.wait(timeout=10)
     assert pause_harness.queue_items == [request_element]
+
+
+def test_pause_kubernetes_pod_wait_condition_end_to_end(pause_harness,
+                                                        monkeypatch):
+    """The real parked-launch condition, driven by the executor's async
+    path: the request goes WAITING, the probe runs off the loop, the
+    scheduler's reason lands on the request, and admission requeues it.
+    Guards the keyword contract between the two sides."""
+
+    def pod(unschedulable_msg=None, scheduled=False):
+        p = mock.MagicMock()
+        p.metadata.name = 'c-head'
+        p.metadata.deletion_timestamp = None
+        p.spec.scheduling_gates = None
+        p.spec.node_name = 'n' if scheduled else None
+        p.status.phase = 'Pending'
+        p.status.conditions = []
+        if unschedulable_msg is not None:
+            cond = mock.MagicMock()
+            cond.type, cond.status = 'PodScheduled', 'False'
+            cond.reason, cond.message = 'Unschedulable', unschedulable_msg
+            p.status.conditions = [cond]
+        return p
+
+    polls = iter([[pod('0/3 nodes are available')], [pod(scheduled=True)]])
+    core_api = mock.MagicMock()
+    core_api.list_namespaced_pod.side_effect = (
+        lambda *a, **k: mock.Mock(items=next(polls)))
+    monkeypatch.setattr('sky.adaptors.kubernetes.core_api',
+                        lambda *a, **k: core_api)
+    condition = pod_wait_condition.KubernetesPodWaitCondition(
+        context=None,
+        namespace='ns',
+        cluster_name_on_cloud='c',
+        expected_pod_names=['c-head'],
+        mode=pod_wait_condition.PARK_MODE_SCHEDULING,
+        deadline=None,
+        poll_seconds=0.01)
+
+    request_element = pause_harness.run(condition, retry_wait_seconds=30)
+
+    assert pause_harness.queued.wait(timeout=10)
+    assert pause_harness.queue_items == [request_element]
+    assert core_api.list_namespaced_pod.call_count == 2
+    updated = requests_lib.get_request(pause_harness.request_id,
+                                       fields=['status', 'status_msg'])
+    # Requeued but not yet picked up: still WAITING, with the reason the
+    # probe reported while the pod was unschedulable.
+    assert updated.status == requests_lib.RequestStatus.WAITING
+    assert updated.status_msg == (
+        'Waiting for pods to be scheduled: 0/3 nodes are available '
+        '(waiting to resume)')
 
 
 class _FailingAsyncCondition(continue_condition_lib.ContinueCondition):

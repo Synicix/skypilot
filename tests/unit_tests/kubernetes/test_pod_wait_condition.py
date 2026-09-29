@@ -10,13 +10,14 @@ cancelled request.
 """
 import asyncio
 import pickle
+import threading
 from unittest import mock
 
 import pytest
 import urllib3
 
 from sky.provision import constants as prov_constants
-from sky.provision.kubernetes import instance
+from sky.provision.kubernetes import pod_wait_condition
 from sky.utils import common_utils
 from sky.utils import schemas
 
@@ -84,14 +85,15 @@ def _serve(monkeypatch, *polls):
 
 def _condition(mode: str,
                pods=('pod-0',),
-               deadline=None) -> instance.KubernetesPodWaitCondition:
-    return instance.KubernetesPodWaitCondition(context='kind-q',
-                                               namespace='skypilot-e2e',
-                                               cluster_name_on_cloud=_CLUSTER,
-                                               expected_pod_names=list(pods),
-                                               mode=mode,
-                                               deadline=deadline,
-                                               poll_seconds=10.0)
+               deadline=None) -> pod_wait_condition.KubernetesPodWaitCondition:
+    return pod_wait_condition.KubernetesPodWaitCondition(
+        context='kind-q',
+        namespace='skypilot-e2e',
+        cluster_name_on_cloud=_CLUSTER,
+        expected_pod_names=list(pods),
+        mode=mode,
+        deadline=deadline,
+        poll_seconds=10.0)
 
 
 @pytest.fixture
@@ -102,8 +104,8 @@ def no_sleep(monkeypatch):
     async def fake_async_sleep(seconds):
         sleeps.append(seconds)
 
-    monkeypatch.setattr(instance.time, 'sleep', sleeps.append)
-    monkeypatch.setattr(instance.asyncio, 'sleep', fake_async_sleep)
+    monkeypatch.setattr(pod_wait_condition.time, 'sleep', sleeps.append)
+    monkeypatch.setattr(pod_wait_condition.asyncio, 'sleep', fake_async_sleep)
     return sleeps
 
 
@@ -111,13 +113,13 @@ class TestProbe:
 
     def test_admission_resumes_when_no_pod_gated(self, monkeypatch):
         _serve(monkeypatch, [_pod('pod-0', gated=True)], [_pod('pod-0')])
-        condition = _condition(instance.PARK_MODE_ADMISSION)
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION)
         assert condition._probe()[0] is False
         assert condition._probe()[0] is True
 
     def test_admission_waits_while_any_pod_gated(self, monkeypatch):
         _serve(monkeypatch, [_pod('pod-0'), _pod('pod-1', gated=True)])
-        condition = _condition(instance.PARK_MODE_ADMISSION,
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION,
                                pods=('pod-0', 'pod-1'))
         assert condition._probe()[0] is False
 
@@ -127,21 +129,51 @@ class TestProbe:
             _pod('pod-1', unschedulable_msg='0/3 nodes are available')
         ], [_pod('pod-0', scheduled=True),
             _pod('pod-1', scheduled=True)])
-        condition = _condition(instance.PARK_MODE_SCHEDULING,
+        condition = _condition(pod_wait_condition.PARK_MODE_SCHEDULING,
                                pods=('pod-0', 'pod-1'))
         assert condition._probe() == (
             False, 'Waiting for pods to be scheduled: 0/3 nodes are available')
         assert condition._probe()[0] is True
 
-    @pytest.mark.parametrize(
-        'mode', [instance.PARK_MODE_ADMISSION, instance.PARK_MODE_SCHEDULING])
-    def test_resumes_when_expected_pod_missing(self, monkeypatch, mode):
+    @pytest.mark.parametrize('mode', [
+        pod_wait_condition.PARK_MODE_ADMISSION,
+        pod_wait_condition.PARK_MODE_SCHEDULING
+    ])
+    def test_resumes_once_a_pod_has_been_missing_for_the_grace(
+            self, monkeypatch, mode):
+        """Same grace as the in-worker wait: one list that omits a pod may
+        be a stale read, so it is a missed poll, not a deletion."""
         _serve(monkeypatch, [_pod('pod-1', gated=True)])
+        now = [1000.0]
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: now[0])
         condition = _condition(mode, pods=('pod-0', 'pod-1'))
+        assert condition._probe() == (False, None)
+        now[0] += pod_wait_condition.MISSING_POD_GRACE_SECONDS - 1
+        assert condition._probe() == (False, None)
+        now[0] += 1
+        assert condition._probe() == (True, None)
+
+    def test_a_pod_listed_again_starts_the_grace_over(self, monkeypatch):
+        grace = pod_wait_condition.MISSING_POD_GRACE_SECONDS
+        _serve(monkeypatch, [_pod('pod-1', gated=True)],
+               [_pod('pod-0', gated=True),
+                _pod('pod-1', gated=True)], [_pod('pod-1', gated=True)])
+        now = [1000.0]
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: now[0])
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION,
+                               pods=('pod-0', 'pod-1'))
+        assert condition._probe()[0] is False  # missing
+        now[0] += grace - 1
+        assert condition._probe()[0] is False  # back: a stale read
+        now[0] += 2
+        assert condition._probe()[0] is False  # missing again, new streak
+        now[0] += grace
         assert condition._probe()[0] is True
 
-    @pytest.mark.parametrize(
-        'mode', [instance.PARK_MODE_ADMISSION, instance.PARK_MODE_SCHEDULING])
+    @pytest.mark.parametrize('mode', [
+        pod_wait_condition.PARK_MODE_ADMISSION,
+        pod_wait_condition.PARK_MODE_SCHEDULING
+    ])
     def test_resumes_when_pod_has_deletion_timestamp(self, monkeypatch, mode):
         _serve(monkeypatch, [_pod('pod-0', gated=True, deleting=True)])
         condition = _condition(mode)
@@ -149,32 +181,47 @@ class TestProbe:
 
     def test_resumes_at_deadline(self, monkeypatch):
         core_api = _serve(monkeypatch, [_pod('pod-0', gated=True)])
-        condition = _condition(instance.PARK_MODE_ADMISSION, deadline=100.0)
-        monkeypatch.setattr(instance.time, 'time', lambda: 99.0)
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION,
+                               deadline=100.0)
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: 99.0)
         assert condition._probe()[0] is False
-        monkeypatch.setattr(instance.time, 'time', lambda: 101.0)
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: 101.0)
         assert condition._probe()[0] is True
         # Past the deadline the answer is known without asking the cluster.
         assert core_api.list_namespaced_pod.call_count == 1
 
     @pytest.mark.parametrize('error', [
         urllib3.exceptions.MaxRetryError(None, '/api/v1/pods'),
-        instance.kubernetes.api_exception()(status=0, reason='SSL'),
+        pod_wait_condition.kubernetes.api_exception()(status=0, reason='SSL'),
     ])
     def test_transport_error_is_a_missed_poll(self, monkeypatch, error):
         _serve(monkeypatch, error)
-        condition = _condition(instance.PARK_MODE_ADMISSION)
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION)
         assert condition._probe() == (False, None)
 
-    @pytest.mark.parametrize('status', [401, 403, 500])
-    def test_api_error_response_resumes_now(self, monkeypatch, status):
-        """An error response is what the wait itself raises at once; resume
-        so the resumed attempt reports it instead of parking forever on a
-        revoked credential or a broken API server."""
+    @pytest.mark.parametrize('status', [429, 500, 502, 503, 504])
+    def test_overloaded_api_server_is_a_missed_poll(self, monkeypatch, status):
+        """Hundreds of parked launches share one API server; a 429 or 5xx
+        must not resume them all at once into workers that fail the same
+        way. It counts against the transport-error grace like a timeout."""
         _serve(
             monkeypatch,
-            instance.kubernetes.api_exception()(status=status, reason='denied'))
-        condition = _condition(instance.PARK_MODE_ADMISSION)
+            pod_wait_condition.kubernetes.api_exception()(status=status,
+                                                          reason='busy'))
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION)
+        assert condition._probe() == (False, None)
+        assert condition._transport_error_since is not None
+
+    @pytest.mark.parametrize('status', [401, 403, 404])
+    def test_api_error_response_resumes_now(self, monkeypatch, status):
+        """An answer (revoked credential, namespace gone) is what the wait
+        itself raises at once; resume so the resumed attempt reports it
+        instead of parking forever."""
+        _serve(
+            monkeypatch,
+            pod_wait_condition.kubernetes.api_exception()(status=status,
+                                                          reason='denied'))
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION)
         assert condition._probe() == (True, None)
 
     def test_persistent_transport_errors_resume_after_grace(self, monkeypatch):
@@ -182,9 +229,9 @@ class TestProbe:
         longer than the grace ends the park so the error surfaces."""
         _serve(monkeypatch, urllib3.exceptions.MaxRetryError(None, '/'))
         now = [1000.0]
-        monkeypatch.setattr(instance.time, 'time', lambda: now[0])
-        condition = _condition(instance.PARK_MODE_SCHEDULING)
-        grace = instance._POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: now[0])
+        condition = _condition(pod_wait_condition.PARK_MODE_SCHEDULING)
+        grace = pod_wait_condition.POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
         assert condition._probe()[0] is False
         now[0] += grace - 1
         assert condition._probe()[0] is False
@@ -192,12 +239,12 @@ class TestProbe:
         assert condition._probe()[0] is True
 
     def test_transport_error_streak_resets_after_a_good_poll(self, monkeypatch):
-        grace = instance._POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
+        grace = pod_wait_condition.POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
         error = urllib3.exceptions.MaxRetryError(None, '/')
         _serve(monkeypatch, error, [_pod('pod-0', gated=True)], error, error)
         now = [1000.0]
-        monkeypatch.setattr(instance.time, 'time', lambda: now[0])
-        condition = _condition(instance.PARK_MODE_ADMISSION)
+        monkeypatch.setattr(pod_wait_condition.time, 'time', lambda: now[0])
+        condition = _condition(pod_wait_condition.PARK_MODE_ADMISSION)
         assert condition._probe()[0] is False  # error, streak starts
         now[0] += grace - 1
         assert condition._probe()[0] is False  # good poll, streak ends
@@ -217,7 +264,7 @@ class TestWait:
         async def is_cancelled():
             return True
 
-        result = await _condition(instance.PARK_MODE_ADMISSION
+        result = await _condition(pod_wait_condition.PARK_MODE_ADMISSION
                                  ).wait_async(is_cancelled=is_cancelled,
                                               fallback_wait_seconds=30)
         assert result is False
@@ -234,7 +281,7 @@ class TestWait:
         async def is_cancelled():
             return False
 
-        result = await _condition(instance.PARK_MODE_ADMISSION
+        result = await _condition(pod_wait_condition.PARK_MODE_ADMISSION
                                  ).wait_async(is_cancelled=is_cancelled,
                                               fallback_wait_seconds=30)
         assert result is True
@@ -248,7 +295,7 @@ class TestWait:
         async def is_cancelled():
             return False
 
-        result = await _condition(instance.PARK_MODE_ADMISSION
+        result = await _condition(pod_wait_condition.PARK_MODE_ADMISSION
                                  ).wait_async(is_cancelled=is_cancelled,
                                               fallback_wait_seconds=30)
         assert result is True
@@ -270,10 +317,11 @@ class TestWait:
         async def update_status_msg(reason):
             reasons.append(reason)
 
-        result = await _condition(instance.PARK_MODE_SCHEDULING).wait_async(
-            is_cancelled=is_cancelled,
-            fallback_wait_seconds=30,
-            update_status_msg=update_status_msg)
+        result = await _condition(pod_wait_condition.PARK_MODE_SCHEDULING
+                                 ).wait_async(
+                                     is_cancelled=is_cancelled,
+                                     fallback_wait_seconds=30,
+                                     update_status_msg=update_status_msg)
         assert result is True
         # Same wording as the message the launch parked with, so the status
         # reads the same before and after a refresh.
@@ -294,8 +342,9 @@ class TestWait:
         async def is_cancelled():
             return False
 
-        assert await _condition(instance.PARK_MODE_SCHEDULING).wait_async(
-            is_cancelled=is_cancelled, fallback_wait_seconds=30) is True
+        assert await _condition(pod_wait_condition.PARK_MODE_SCHEDULING
+                               ).wait_async(is_cancelled=is_cancelled,
+                                            fallback_wait_seconds=30) is True
 
     def test_wait_and_wait_async_agree(self, monkeypatch, no_sleep):
         timeline = ([_pod('pod-0', unschedulable_msg='a')
@@ -304,7 +353,7 @@ class TestWait:
 
         sync_api = _serve(monkeypatch, *timeline)
         sync_reasons = []
-        sync_result = _condition(instance.PARK_MODE_SCHEDULING).wait(
+        sync_result = _condition(pod_wait_condition.PARK_MODE_SCHEDULING).wait(
             is_cancelled=lambda: False,
             fallback_wait_seconds=30,
             update_status_msg=sync_reasons.append)
@@ -321,7 +370,7 @@ class TestWait:
             async_reasons.append(reason)
 
         async_result = asyncio.run(
-            _condition(instance.PARK_MODE_SCHEDULING).wait_async(
+            _condition(pod_wait_condition.PARK_MODE_SCHEDULING).wait_async(
                 is_cancelled=is_cancelled,
                 fallback_wait_seconds=30,
                 update_status_msg=update_status_msg))
@@ -340,19 +389,62 @@ class TestWait:
         del no_sleep
         _serve(monkeypatch, [_pod('pod-0', gated=True)])
         answers = iter([False, False, True])
-        assert _condition(instance.PARK_MODE_ADMISSION).wait(
+        assert _condition(pod_wait_condition.PARK_MODE_ADMISSION).wait(
             is_cancelled=lambda: next(answers),
             fallback_wait_seconds=30) is False
+
+
+def test_default_poll_interval_is_long():
+    """Every parked launch on the server polls at this rate, for hours; the
+    launch already waited out a grace before parking, so a resume delayed by
+    one interval costs nothing next to the queue."""
+    assert pod_wait_condition.DEFAULT_POLL_SECONDS == 30.0
+    condition = pod_wait_condition.KubernetesPodWaitCondition(
+        context=None,
+        namespace='ns',
+        cluster_name_on_cloud=_CLUSTER,
+        expected_pod_names=['pod-0'],
+        mode=pod_wait_condition.PARK_MODE_ADMISSION,
+        deadline=None)
+    assert condition.poll_seconds == 30.0
+
+
+@pytest.mark.asyncio
+async def test_probes_run_on_their_own_bounded_pool(monkeypatch, no_sleep):
+    """The list call runs off the event loop, on the probe pool rather than
+    the loop's default executor: a slow API server then delays resumes,
+    not the cancellation checks every parked request shares."""
+    del no_sleep
+    threads = []
+    real_probe = pod_wait_condition.KubernetesPodWaitCondition._probe
+
+    def probe(self):
+        threads.append(threading.current_thread().name)
+        return real_probe(self)
+
+    monkeypatch.setattr(pod_wait_condition.KubernetesPodWaitCondition, '_probe',
+                        probe)
+    _serve(monkeypatch, [_pod('pod-0', gated=True)], [_pod('pod-0')])
+
+    async def is_cancelled():
+        return False
+
+    assert await _condition(pod_wait_condition.PARK_MODE_ADMISSION).wait_async(
+        is_cancelled=is_cancelled, fallback_wait_seconds=30) is True
+    assert len(threads) == 2
+    assert all(name.startswith('sky-parked-launch-probe') for name in threads)
+    assert (pod_wait_condition._get_probe_pool()._max_workers ==
+            pod_wait_condition._PROBE_THREADS)
 
 
 def test_condition_pickles():
     """The condition rides on ExecutionPausedError across the executor's
     process boundary."""
-    condition = _condition(instance.PARK_MODE_SCHEDULING,
+    condition = _condition(pod_wait_condition.PARK_MODE_SCHEDULING,
                            pods=('pod-0', 'pod-1'),
                            deadline=123.5)
     restored = pickle.loads(pickle.dumps(condition))
-    assert type(restored) is instance.KubernetesPodWaitCondition
+    assert type(restored) is pod_wait_condition.KubernetesPodWaitCondition
     assert restored.__dict__ == condition.__dict__
 
 
@@ -360,7 +452,7 @@ def test_condition_is_async_capable():
     """The executor uses wait_async (a coroutine on its shared loop, no OS
     thread per parked request) only when it is a coroutine function."""
     assert asyncio.iscoroutinefunction(
-        instance.KubernetesPodWaitCondition.wait_async)
+        pod_wait_condition.KubernetesPodWaitCondition.wait_async)
 
 
 @pytest.mark.parametrize('config', [

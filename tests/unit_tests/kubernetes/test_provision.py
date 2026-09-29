@@ -17,6 +17,7 @@ from sky.provision import common as provision_common
 from sky.provision.kubernetes import config as config_lib
 from sky.provision.kubernetes import constants as k8s_constants
 from sky.provision.kubernetes import instance
+from sky.provision.kubernetes import pod_wait_condition
 from sky.provision.kubernetes import utils as kubernetes_utils
 from sky.provision.kubernetes.instance import logger
 from sky.utils import subprocess_utils
@@ -175,6 +176,8 @@ class TestCreatePodsResumedAfterPark:
             side_effect=lambda **kwargs: config_lib.KubernetesError(
                 f'deleted: {sorted(kwargs["deleted_pods"])}'))
         monkeypatch.setattr(instance, '_deleted_pods_error', deleted_error)
+        self.sleeps = []
+        monkeypatch.setattr(instance.time, 'sleep', self.sleeps.append)
         return core_api, deleted_error
 
     def test_resume_raises_when_all_parked_pods_were_deleted(self, monkeypatch):
@@ -204,6 +207,60 @@ class TestCreatePodsResumedAfterPark:
         core_api.create_namespaced_pod.assert_not_called()
         assert set(deleted_error.call_args.kwargs['deleted_pods']) == {
             f'{self._CLUSTER}-worker1'
+        }
+
+    def test_a_missing_pod_is_re_listed_before_failing(self, monkeypatch):
+        """One list that omits a pod may be a stale read; the launch waits
+        the missing-pod grace and looks again before giving up on hours in
+        a queue."""
+        head = f'{self._CLUSTER}-head'
+        worker = f'{self._CLUSTER}-worker1'
+        core_api, deleted_error = self._setup(monkeypatch,
+                                              {head: _fake_pod(head)},
+                                              requested_before=110.0)
+        reads = iter([{
+            head: _fake_pod(head)
+        }, {
+            head: _fake_pod(head),
+            worker: _fake_pod(worker)
+        }])
+
+        def filter_pods(namespace, context, tags, phases):
+            del namespace, context, tags
+            return next(reads) if 'Pending' in phases else {}
+
+        monkeypatch.setattr(kubernetes_utils, 'filter_pods', filter_pods)
+        record = instance._create_pods('us', 'cn', self._CLUSTER,
+                                       _make_provision_config(count=2))
+        assert self.sleeps == [pod_wait_condition.MISSING_POD_GRACE_SECONDS]
+        core_api.create_namespaced_pod.assert_not_called()
+        deleted_error.assert_not_called()
+        assert record.head_instance_id == head
+
+    def test_a_pod_that_failed_while_parked_explains_itself(self, monkeypatch):
+        """_create_pods deletes Failed/Succeeded pods before looking for the
+        parked ones; the error gets that pod object, whose own status says
+        what happened, not a pod that was only ever seen missing."""
+        head = f'{self._CLUSTER}-head'
+        worker = f'{self._CLUSTER}-worker1'
+        _, deleted_error = self._setup(monkeypatch, {head: _fake_pod(head)},
+                                       requested_before=110.0)
+        failed_worker = _fake_pod(worker)
+
+        def filter_pods(namespace, context, tags, phases):
+            del namespace, context, tags
+            if 'Failed' in phases:
+                return {worker: failed_worker}
+            return {head: _fake_pod(head)} if 'Pending' in phases else {}
+
+        monkeypatch.setattr(kubernetes_utils, 'filter_pods', filter_pods)
+        monkeypatch.setattr(kubernetes_utils, 'delete_k8s_resource_with_retry',
+                            lambda **kwargs: None)
+        with pytest.raises(config_lib.KubernetesError, match='deleted'):
+            instance._create_pods('us', 'cn', self._CLUSTER,
+                                  _make_provision_config(count=2))
+        assert deleted_error.call_args.kwargs['deleted_pods'] == {
+            worker: failed_worker
         }
 
     def test_resume_with_all_pods_present_creates_nothing(self, monkeypatch):
@@ -2353,8 +2410,9 @@ class TestWaitForPodsToScheduleParking:
         assert 'Waiting for queue admission' in str(err)
         assert err.retry_wait_seconds == 30
         condition = err.continue_condition
-        assert isinstance(condition, instance.KubernetesPodWaitCondition)
-        assert condition.mode == instance.PARK_MODE_ADMISSION
+        assert isinstance(condition,
+                          pod_wait_condition.KubernetesPodWaitCondition)
+        assert condition.mode == pod_wait_condition.PARK_MODE_ADMISSION
         assert condition.expected_pod_names == ['pod-0']
         assert condition.cluster_name_on_cloud == 'my-cluster'
         assert condition.namespace == 'ns'
@@ -2450,6 +2508,19 @@ class TestWaitForPodsToScheduleParking:
             self._wait(timeout=-1, admission_timeout=300)
         assert info.value.continue_condition.deadline is None
 
+    def test_resumed_attempt_still_gated_parks_again(self, monkeypatch):
+        """A resumed attempt whose pods are still gated (the condition
+        resumed it for a deleted-looking pod that came back, or a stale
+        anchor) parks again after the grace, with the same unbounded
+        deadline, rather than holding the worker for the rest of the wait."""
+        clock, _, _ = self._setup(monkeypatch, [(0.0, [self._gated()])],
+                                  start=5000.0,
+                                  requested_at=0.0)
+        with pytest.raises(sky_exceptions.ExecutionPausedError) as info:
+            self._wait(timeout=-1, admission_timeout=300)
+        assert 5000.0 + instance._PARK_AFTER_GATED_SECONDS <= clock.now < 5040
+        assert info.value.continue_condition.deadline is None
+
     def test_partially_gated_group_parks(self, monkeypatch):
         """A pod group admitted in part is still a queue wait."""
         ungated = self._make_pending_pod('pod-1', 'my-cluster')
@@ -2494,7 +2565,7 @@ class TestWaitForPodsToScheduleParking:
         assert str(err) == ('Waiting for pods to be scheduled: '
                             '0/3 nodes are available')
         assert err.retry_wait_seconds == 30
-        assert err.continue_condition.mode == instance.PARK_MODE_SCHEDULING
+        assert err.continue_condition.mode == pod_wait_condition.PARK_MODE_SCHEDULING
         assert err.continue_condition.deadline is None
         assert not raise_errors.called
 
@@ -2648,7 +2719,7 @@ class TestWaitForPodsToScheduleTransportErrors:
         def list_pods(namespace, label_selector=None, **kwargs):
             del namespace, label_selector  # unused
             assert kwargs.get('_request_timeout') == (
-                instance._POD_POLL_REQUEST_TIMEOUT)
+                pod_wait_condition.POD_POLL_REQUEST_TIMEOUT)
             state['n'] += 1
             if state['n'] <= failures:
                 raise error_factory()
@@ -2701,7 +2772,7 @@ class TestWaitForPodsToScheduleTransportErrors:
             # from the transport-error budget, not the deadline.
             self._wait(timeout=10**6)
 
-        assert clock.now >= instance._POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
+        assert clock.now >= pod_wait_condition.POD_POLL_TRANSPORT_ERROR_GRACE_SECONDS
         # Each missed poll costs ~1s of (fake) sleep, so the streak is
         # roughly one attempt per second of the grace window.
         assert core_api.list_namespaced_pod.call_count > 2
@@ -3044,7 +3115,7 @@ class TestWaitForPodsToScheduleDeletedPods:
         matters is that it is the grace window that ended the wait and not
         the provision timeout, which is two orders of magnitude further out.
         """
-        expected = deleted_at + instance._MISSING_POD_GRACE_SECONDS
+        expected = deleted_at + pod_wait_condition.MISSING_POD_GRACE_SECONDS
         assert expected <= clock.now <= expected + 1.0, clock.now
 
     def _wait(self, node, timeout=None):
@@ -3100,7 +3171,7 @@ class TestWaitForPodsToScheduleDeletedPods:
         # the point: the window is insurance against a bad poll and a reason
         # that has not been recorded yet, and a user watching a launch has to
         # see it fail. See _MISSING_POD_GRACE_SECONDS.
-        assert instance._MISSING_POD_GRACE_SECONDS == 10
+        assert pod_wait_condition.MISSING_POD_GRACE_SECONDS == 10
         assert clock.now <= 11.5, clock.now
 
     def test_a_brief_gap_in_the_pod_list_is_tolerated(self, monkeypatch):
@@ -3119,7 +3190,7 @@ class TestWaitForPodsToScheduleDeletedPods:
         self._wait(node)
 
         assert not raise_errors.called
-        assert clock.now < instance._MISSING_POD_GRACE_SECONDS, (
+        assert clock.now < pod_wait_condition.MISSING_POD_GRACE_SECONDS, (
             'The wait must return as soon as the pod is back and bound.')
 
     def test_terminating_pod_fails_fast_with_its_condition(self, monkeypatch):
